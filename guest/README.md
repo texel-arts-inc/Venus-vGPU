@@ -30,13 +30,13 @@ The `venus-guest` target generates `guest/artifacts/Image`, `guest/artifacts/gue
 - `VENUS_GUEST_GPU=nouveau` selects the Linux Nouveau kernel driver and Fedora Mesa's NVK Vulkan ICD. Install `mesa-vulkan-drivers` and `nvidia-gpu-firmware` in the builder first. The Ada card uses NVIDIA GSP firmware from Fedora's firmware package. Apple PCIe passthrough, NVK rendering and SELinux behavior on this path are experimental. The guest reports the host's managed sleep request as unsupported because the NVIDIA-specific VRAM retention protocol is unavailable. [Mesa NVK documentation](https://docs.mesa3d.org/drivers/nvk.html)
 - Nova is an experimental Rust GSP kernel driver under development. The guest configuration disables Nova and this project has no verified Nova/NVK or Nova passthrough path. [Linux Nova documentation](https://docs.kernel.org/gpu/nova/index.html)
 
-For NVIDIA, read the installer license and obtain `NVIDIA-Linux-aarch64-620.70.06.run` directly from NVIDIA. If you accept the license, configure with these options in addition to `VENUS_BUILD_GUEST=ON`. [NVIDIA installer and license](https://download.nvidia.com/XFree86/Linux-aarch64/620.70.06/)
+For NVIDIA, obtain `NVIDIA-Linux-aarch64-620.70.06.run` directly from NVIDIA or let the build download it. Configure with these options in addition to `VENUS_BUILD_GUEST=ON`. [NVIDIA installer and license](https://download.nvidia.com/XFree86/Linux-aarch64/620.70.06/)
 
 ```sh
--DVENUS_GUEST_GPU=nvidia -DVENUS_GUEST_ACCEPT_NVIDIA_LICENSE=ON -DVENUS_GUEST_NVIDIA_INSTALLER=/absolute/path/NVIDIA-Linux-aarch64-620.70.06.run
+-DVENUS_GUEST_GPU=nvidia -DVENUS_GUEST_NVIDIA_INSTALLER=/absolute/path/NVIDIA-Linux-aarch64-620.70.06.run
 ```
 
-To download that same installer during the build, substitute `-DVENUS_GUEST_DOWNLOAD_NVIDIA=ON` for the local installer path. Both inputs are checked against NVIDIA's published SHA-256. The resulting NVIDIA guest contains NVIDIA components and is for use under the accepted license. [NVIDIA's published checksum](https://download.nvidia.com/XFree86/Linux-aarch64/620.70.06/NVIDIA-Linux-aarch64-620.70.06.run.sha256sum)
+To download that same installer during the build, substitute `-DVENUS_GUEST_DOWNLOAD_NVIDIA=ON` for the local installer path. Run `cmake --build` from an interactive terminal. It prints the verified NVIDIA agreement and asks for your acceptance before it downloads or stages the installer. The build records acceptance for this agreement in its output directory, so subsequent builds in that directory reuse it. Both installer inputs are checked against NVIDIA's published SHA-256. [NVIDIA's published checksum](https://download.nvidia.com/XFree86/Linux-aarch64/620.70.06/NVIDIA-Linux-aarch64-620.70.06.run.sha256sum)
 
 ## Build inputs
 

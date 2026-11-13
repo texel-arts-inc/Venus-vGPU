@@ -13,7 +13,6 @@ set(VENUS_GUEST_MODULE_KEY "" CACHE FILEPATH "Private RSA signing key and certif
 set(VENUS_GUEST_NVIDIA_INSTALLER "" CACHE FILEPATH "Local NVIDIA-Linux-aarch64-620.70.06.run")
 set(VENUS_GUEST_NVIDIA_SHA256 "3fa65a9271e0dde2a4e58c4965c38885a02a3a42accdcb26fc817410607f3e03")
 option(VENUS_GUEST_DOWNLOAD_NVIDIA "Download the pinned NVIDIA installer" OFF)
-option(VENUS_GUEST_ACCEPT_NVIDIA_LICENSE "Confirm acceptance of the NVIDIA installer license" OFF)
 set(VENUS_GUEST_SOURCE_DATE_EPOCH "1793966400" CACHE STRING "Unix timestamp used for guest builds")
 set(VENUS_GUEST_VRAM_SIZE_MIB "24576" CACHE STRING "VRAM scratch capacity in MiB")
 include(ProcessorCount)
@@ -38,9 +37,6 @@ foreach(path VENUS_GUEST_LINUX_SOURCE VENUS_GUEST_LINUX_ARCHIVE VENUS_GUEST_MODU
 endforeach()
 
 if(VENUS_GUEST_GPU STREQUAL "nvidia")
-  if(NOT VENUS_GUEST_ACCEPT_NVIDIA_LICENSE)
-    message(FATAL_ERROR "Review https://download.nvidia.com/XFree86/Linux-aarch64/620.70.06/license.txt and set VENUS_GUEST_ACCEPT_NVIDIA_LICENSE=ON if you accept it.")
-  endif()
   if(VENUS_GUEST_NVIDIA_INSTALLER AND VENUS_GUEST_DOWNLOAD_NVIDIA)
     message(FATAL_ERROR "Choose a local NVIDIA installer or enable VENUS_GUEST_DOWNLOAD_NVIDIA.")
   endif()
@@ -129,14 +125,33 @@ set(linux_stamp "${guest_build}/venus-linux-source-prefix/src/venus-linux-source
 
 set(nvidia_archive "")
 if(VENUS_GUEST_GPU STREQUAL "nvidia")
+  set(nvidia_base_url "https://download.nvidia.com/XFree86/Linux-aarch64/620.70.06")
+  set(nvidia_license_sha256 "c692fb14ad4f499c6aee1b9e144e6905148c420e6225b17cb2937366c1e507ad")
+  set(nvidia_license "${guest_build}/NVIDIA-620.70.06-license.txt")
+  set(nvidia_receipt "${guest_build}/NVIDIA-620.70.06-license.accepted")
   set(nvidia_archive "${guest_build}/NVIDIA-Linux-aarch64-620.70.06.run")
+  add_custom_command(
+    OUTPUT "${nvidia_license}"
+    COMMAND "${CMAKE_COMMAND}" "-DDESTINATION=${nvidia_license}"
+            "-DURL=${nvidia_base_url}/license.txt"
+            "-DSHA256=${nvidia_license_sha256}" -P "${guest_dir}/cmake/Acquire.cmake"
+    DEPENDS "${guest_dir}/cmake/Acquire.cmake"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT "${nvidia_receipt}"
+    COMMAND "${Python3_EXECUTABLE}" "${guest_dir}/cmake/accept-driver-license.py"
+            "${nvidia_license}" "${nvidia_license_sha256}" "${nvidia_receipt}"
+    DEPENDS "${nvidia_license}" "${guest_dir}/cmake/accept-driver-license.py"
+    USES_TERMINAL VERBATIM)
+  add_custom_target(venus-nvidia-license DEPENDS "${nvidia_receipt}")
   add_custom_command(
     OUTPUT "${nvidia_archive}"
     COMMAND "${CMAKE_COMMAND}" "-DLOCAL_FILE=${VENUS_GUEST_NVIDIA_INSTALLER}"
             "-DDESTINATION=${nvidia_archive}"
-            "-DURL=https://download.nvidia.com/XFree86/Linux-aarch64/620.70.06/NVIDIA-Linux-aarch64-620.70.06.run"
+            "-DURL=${nvidia_base_url}/NVIDIA-Linux-aarch64-620.70.06.run"
             "-DSHA256=${VENUS_GUEST_NVIDIA_SHA256}" -P "${guest_dir}/cmake/Acquire.cmake"
-    DEPENDS "${guest_build}/guest-inputs" "${guest_dir}/cmake/Acquire.cmake" ${VENUS_GUEST_NVIDIA_INSTALLER}
+    DEPENDS "${nvidia_receipt}" "${guest_build}/guest-inputs" "${guest_dir}/cmake/Acquire.cmake"
+            ${VENUS_GUEST_NVIDIA_INSTALLER}
     USES_TERMINAL VERBATIM)
 endif()
 
