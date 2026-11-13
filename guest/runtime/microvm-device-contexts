@@ -1,0 +1,11 @@
+/dev/vport[0-9]+p[0-9]+ -c system_u:object_r:venus_microvm_port_t:s0
+/dev/venus-ivshmem -c system_u:object_r:venus_pm_device_t:s0
+/dev/rv-guest-pool -c system_u:object_r:venus_pm_device_t:s0
+/dev/nvidia[0-9]+ -c system_u:object_r:venus_pm_device_t:s0
+/dev/nvidiactl -c system_u:object_r:venus_pm_device_t:s0
+/dev/nvidia-modeset -c system_u:object_r:venus_pm_device_t:s0
+/dev/dri/(card[0-9]+|renderD[0-9]+) -c system_u:object_r:dri_device_t:s0
+/dev/console -c system_u:object_r:console_device_t:s0
+/dev/null -c system_u:object_r:null_device_t:s0
+/dev/(random|urandom) -c system_u:object_r:random_device_t:s0
+/run/venus(/.*)? -d system_u:object_r:venus_microvm_run_t:s0

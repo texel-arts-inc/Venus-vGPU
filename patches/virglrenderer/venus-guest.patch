@@ -1,0 +1,859 @@
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -158,6 +158,25 @@
+       free(cmd);
+ 
+    return ok;
++}
++
++static bool
++render_context_dispatch_pm_check(struct render_context *ctx,
++                                 const union render_context_op_request *request,
++                                 const int *fds, int fd_count)
++{
++   if (fd_count != 1)
++      return false;
++   const struct render_context_op_pm_check_request *req = &request->pm_check;
++   int32_t status = EINVAL;
++   if (req->transition && req->verify <= 1)
++      status = render_state_pm_check(ctx->ctx_id, req->transition, req->verify);
++   ssize_t sent;
++   do {
++      sent = send(fds[0], &status, sizeof(status), MSG_DONTWAIT | MSG_NOSIGNAL);
++   } while (sent < 0 && errno == EINTR);
++   close(fds[0]);
++   return true;
+ }
+ 
+ static bool
+@@ -285,6 +304,7 @@
+       RENDER_CONTEXT_DISPATCH(SUBMIT_CMD, submit_cmd, 0),
+       RENDER_CONTEXT_DISPATCH(SUBMIT_FENCE, submit_fence, 0),
+       RENDER_CONTEXT_DISPATCH(ATTACH_FENCE_SOCKET, attach_fence_socket, 1),
++      RENDER_CONTEXT_DISPATCH(PM_CHECK, pm_check, 1),
+ #undef RENDER_CONTEXT_DISPATCH
+    };
+ 
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -11,7 +11,7 @@
+ #include "virgl_resource.h"
+ 
+ /* this covers the command line options and the socket type */
+-#define RENDER_SERVER_VERSION 0
++#define RENDER_SERVER_VERSION 1
+ 
+ /* The protocol itself is internal to virglrenderer.  There is no backward
+  * compatibility to be kept.
+@@ -40,6 +40,7 @@
+    RENDER_CONTEXT_OP_SUBMIT_CMD,
+    RENDER_CONTEXT_OP_SUBMIT_FENCE,
+    RENDER_CONTEXT_OP_ATTACH_FENCE_SOCKET,
++   RENDER_CONTEXT_OP_PM_CHECK,
+ 
+    RENDER_CONTEXT_OP_COUNT,
+ };
+@@ -235,7 +236,13 @@
+  * ("everything before me was consumed") and must stay on the main socket.
+  */
+ struct render_context_op_attach_fence_socket_request {
++   struct render_context_op_header header;
++};
++
++struct render_context_op_pm_check_request {
+    struct render_context_op_header header;
++   uint32_t verify;
++   uint64_t transition;
+ };
+ 
+ union render_context_op_request {
+@@ -248,6 +255,7 @@
+    struct render_context_op_submit_cmd_request submit_cmd;
+    struct render_context_op_submit_fence_request submit_fence;
+    struct render_context_op_attach_fence_socket_request attach_fence_socket;
++   struct render_context_op_pm_check_request pm_check;
+ };
+ 
+ #ifdef __APPLE__
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -5,6 +5,8 @@
+ 
+ #include "render_state.h"
+ 
++#include <errno.h>
++
+ #include <inttypes.h>
+ 
+ #ifdef ENABLE_RENDER_SERVER_WORKER_THREAD
+@@ -307,6 +309,19 @@
+    render_state_remove_context(ctx);
+ }
+ 
++int
++render_state_pm_check(uint32_t ctx_id, uint64_t transition, bool verify)
++{
++#ifdef ENABLE_VENUS
++   struct render_context *ctx = render_state_lookup_context(ctx_id);
++   if (ctx && ctx->backend == RENDER_BACKEND_VENUS) {
++      SCOPE_LOCK_RENDERER();
++      return vkr_renderer_pm_check(ctx_id, transition, verify);
++   }
++#endif
++   return ENOTSUP;
++}
++
+ bool
+ render_state_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size)
+ {
+--- a/server/render_state.h
++++ b/server/render_state.h
+@@ -23,6 +23,9 @@
+ void
+ render_state_destroy_context(uint32_t ctx_id);
+ 
++int
++render_state_pm_check(uint32_t ctx_id, uint64_t transition, bool verify);
++
+ bool
+ render_state_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);
+ 
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -84,6 +84,7 @@
+    'venus/vkr_pipeline.c',
+    'venus/vkr_query_pool.c',
+    'venus/vkr_queue.c',
++   'venus/vkr_pm.c',
+    'venus/vkr_render_pass.c',
+    'venus/vkr_renderer.c',
+    'venus/vkr_ring.c',
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -367,9 +367,83 @@
+ 
+    assert(!(proxy_renderer.flags & VIRGL_RENDERER_ASYNC_FENCE_CB));
+    return ctx->sync_thread.fence_eventfd;
++}
++
++#if defined(__linux__)
++static int
++proxy_context_pm_send(struct proxy_context *ctx, uint64_t transition, bool verify)
++{
++   int fds[2];
++   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds))
++      return errno;
++   struct render_context_op_pm_check_request request = {
++      .header.op = RENDER_CONTEXT_OP_PM_CHECK,
++      .transition = transition,
++      .verify = verify,
++   };
++   struct iovec data = {.iov_base = &request, .iov_len = sizeof(request)};
++   union {
++      struct cmsghdr align;
++      char bytes[CMSG_SPACE(sizeof(int))];
++   } control = {0};
++   struct msghdr message = {
++      .msg_iov = &data,
++      .msg_iovlen = 1,
++      .msg_control = control.bytes,
++      .msg_controllen = sizeof(control.bytes),
++   };
++   struct cmsghdr *fd = CMSG_FIRSTHDR(&message);
++   fd->cmsg_level = SOL_SOCKET;
++   fd->cmsg_type = SCM_RIGHTS;
++   fd->cmsg_len = CMSG_LEN(sizeof(int));
++   memcpy(CMSG_DATA(fd), &fds[1], sizeof(int));
++
++   ssize_t sent;
++   do {
++      sent = sendmsg(ctx->socket.fd, &message, MSG_DONTWAIT | MSG_NOSIGNAL);
++   } while (sent < 0 && errno == EINTR);
++   const int error = sent < 0 ? errno : EIO;
++   close(fds[1]);
++   if (sent != sizeof(request)) {
++      close(fds[0]);
++      return error;
++   }
++   ctx->pm_reply_fd = fds[0];
++   ctx->pm_transition = transition;
++   ctx->pm_verify = verify;
++   return EAGAIN;
+ }
+ 
+ static int
++proxy_context_pm_check(struct virgl_context *base, uint64_t transition, bool verify)
++{
++   struct proxy_context *ctx = (struct proxy_context *)base;
++   if (ctx->capset_id != VIRTGPU_DRM_CAPSET_VENUS)
++      return ENOTSUP;
++
++   if (ctx->pm_reply_fd >= 0 &&
++       (ctx->pm_transition != transition || ctx->pm_verify != verify)) {
++      close(ctx->pm_reply_fd);
++      ctx->pm_reply_fd = -1;
++   }
++   if (ctx->pm_reply_fd < 0)
++      return proxy_context_pm_send(ctx, transition, verify);
++
++   int32_t status;
++   ssize_t received;
++   do {
++      received = recv(ctx->pm_reply_fd, &status, sizeof(status), MSG_TRUNC);
++   } while (received < 0 && errno == EINTR);
++   if (received < 0 && errno == EAGAIN)
++      return EAGAIN;
++
++   close(ctx->pm_reply_fd);
++   ctx->pm_reply_fd = -1;
++   return received == sizeof(status) ? status : EIO;
++}
++#endif
++
++static int
+ proxy_context_submit_cmd(struct virgl_context *base, const void *buffer, size_t size)
+ {
+    struct proxy_context *ctx = (struct proxy_context *)base;
+@@ -622,6 +696,8 @@
+ 
+    if (ctx->fence_socket_fd >= 0)
+       close(ctx->fence_socket_fd);
++   if (ctx->pm_reply_fd >= 0)
++      close(ctx->pm_reply_fd);
+ 
+    if (ctx->sync_thread.fence_eventfd >= 0) {
+       if (ctx->sync_thread.created) {
+@@ -672,6 +748,9 @@
+    ctx->base.transfer_3d = proxy_context_transfer_3d;
+    ctx->base.get_blob = proxy_context_get_blob;
+    ctx->base.submit_cmd = proxy_context_submit_cmd;
++#if defined(__linux__)
++   ctx->base.pm_check = proxy_context_pm_check;
++#endif
+ 
+    ctx->base.get_fencing_fd = proxy_context_get_fencing_fd;
+    ctx->base.retire_fences = proxy_context_retire_fences;
+@@ -821,6 +900,7 @@
+    proxy_socket_init(&ctx->socket, ctx_fd);
+    ctx->capset_id = capset_id;
+    ctx->fence_socket_fd = -1;
++   ctx->pm_reply_fd = -1;
+    ctx->shmem.fd = -1;
+    mtx_init(&ctx->timeline_mutex, mtx_plain);
+    mtx_init(&ctx->free_fences_mutex, mtx_plain);
+--- a/src/proxy/proxy_context.h
++++ b/src/proxy/proxy_context.h
+@@ -40,6 +40,9 @@
+     * fences then take the synchronous main-socket path).  Written only
+     * from the submit_fence caller thread. */
+    int fence_socket_fd;
++   int pm_reply_fd;
++   uint64_t pm_transition;
++   bool pm_verify;
+ 
+    /* this tracks resources early attached in get_blob */
+    struct hash_table *resource_table;
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -185,10 +185,17 @@
+    return true;
+ }
+ 
+-static inline void
+-vkr_context_free_resource(struct hash_entry *entry)
++void
++vkr_resource_ref(struct vkr_resource *res)
+ {
+-   struct vkr_resource *res = entry->data;
++   atomic_fetch_add_explicit(&res->refs, 1, memory_order_relaxed);
++}
++
++void
++vkr_resource_unref(struct vkr_resource *res)
++{
++   if (atomic_fetch_sub_explicit(&res->refs, 1, memory_order_acq_rel) != 1)
++      return;
+    if (res->fd_type == VIRGL_RESOURCE_FD_SHM)
+       munmap(res->u.data, res->size);
+    else if (res->u.fd >= 0)
+@@ -196,6 +203,13 @@
+    free(res);
+ }
+ 
++static inline void
++vkr_context_free_resource(struct hash_entry *entry)
++{
++   struct vkr_resource *res = entry->data;
++   vkr_resource_unref(res);
++}
++
+ static inline bool
+ vkr_context_add_resource(struct vkr_context *ctx, struct vkr_resource *res)
+ {
+@@ -235,6 +249,7 @@
+       return false;
+ 
+    res->res_id = res_id;
++   atomic_init(&res->refs, 1); /* resource table ownership */
+    res->fd_type = fd_type;
+    res->size = blob_size;
+ 
+@@ -271,6 +286,12 @@
+       return false;
+    }
+ 
++   /* The imported resource owns the mapping, not the fd used to create it.
++    * The caller transfers fd ownership on success, so close it after mmap.
++    * On failure the caller still owns fd and will close it while unwinding.
++    */
++   close(fd);
++
+    return true;
+ }
+ 
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -20,6 +20,7 @@
+  * vkr_resource is created, and is valid until vkr_context_destroy_resource.
+  */
+ struct vkr_resource {
++   atomic_uint refs;
+    uint32_t res_id;
+ 
+    enum virgl_resource_fd_type fd_type;
+@@ -34,6 +35,9 @@
+    size_t size;
+ };
+ 
++void vkr_resource_ref(struct vkr_resource *res);
++void vkr_resource_unref(struct vkr_resource *res);
++
+ enum vkr_context_validate_level {
+    /* no validation */
+    VKR_CONTEXT_VALIDATE_NONE,
+@@ -123,6 +127,9 @@
+                          uint32_t ring_idx,
+                          uint64_t fence_id);
+ 
++int
++vkr_context_pm_check(struct vkr_context *ctx, uint64_t transition, bool verify);
++
+ bool
+ vkr_context_submit_cmd(struct vkr_context *ctx, const void *buffer, size_t size);
+ 
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -137,7 +137,7 @@
+    /* append extensions for our own use */
+    const char **exts = NULL;
+    uint32_t ext_count = args->pCreateInfo->enabledExtensionCount;
+-   ext_count += physical_dev->is_dma_buf_emulated;
++   ext_count += physical_dev->EXT_external_memory_host;
+    ext_count += physical_dev->KHR_portability_subset;
+    ext_count += physical_dev->KHR_external_memory_fd;
+    ext_count += physical_dev->EXT_external_memory_dma_buf;
+@@ -170,7 +170,7 @@
+          exts[ext_count++] = name;
+       }
+ 
+-      if (physical_dev->is_dma_buf_emulated && !has_external_memory_host)
++      if (physical_dev->EXT_external_memory_host && !has_external_memory_host)
+          exts[ext_count++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+       if (physical_dev->KHR_portability_subset)
+          exts[ext_count++] = "VK_KHR_portability_subset";
+@@ -208,7 +208,7 @@
+                               args->pCreateInfo->ppEnabledExtensionNames,
+                               args->pCreateInfo->enabledExtensionCount);
+ 
+-   if (physical_dev->is_dma_buf_emulated) {
++   if (physical_dev->EXT_external_memory_host) {
+       dev->GetMemoryHostPointerPropertiesEXT =
+          (PFN_vkGetMemoryHostPointerPropertiesEXT)vk->GetDeviceProcAddr(
+             dev->base.handle.device, "vkGetMemoryHostPointerPropertiesEXT");
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -301,12 +301,64 @@
+       return;
+    }
+ 
+-   /* translate VkImportMemoryResourceInfoMESA into VkImportMemoryFdInfoKHR in place */
++   /* Resource IDs in [0x40000000, 0x7fffffff] are reserved by the guest
++    * renderer for kernel-verified ordinary guest RAM lease FDs. In
++    * particular, CPU IVSHMEM BAR resources (bit 31 set) are excluded.
++    */
++   struct vkr_resource *host_ram_res = NULL;
++   VkImportMemoryHostPointerInfoEXT local_resource_host_import;
++   VkMemoryHostPointerPropertiesEXT resource_host_props = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
++   };
++   VkBaseInStructure *resource_node = vkr_find_prev_struct(
++      alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
++   VkImportMemoryResourceInfoMESA *resource_info = resource_node
++      ? (VkImportMemoryResourceInfoMESA *)resource_node->pNext : NULL;
++   if (resource_info && resource_info->resourceId >= 0x40000000u &&
++       resource_info->resourceId < 0x80000000u) {
++      if (!physical_dev->EXT_external_memory_host ||
++          !dev->GetMemoryHostPointerPropertiesEXT) {
++         vkr_log("guest RAM import needs VK_EXT_external_memory_host");
++         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++         return;
++      }
++      host_ram_res = vkr_context_get_resource(ctx, resource_info->resourceId);
++      if (!host_ram_res || host_ram_res->fd_type != VIRGL_RESOURCE_FD_SHM ||
++          !host_ram_res->u.data || alloc_info->allocationSize > host_ram_res->size ||
++          ((uintptr_t)host_ram_res->u.data & (getpagesize() - 1))) {
++         vkr_log("guest RAM resource %#x is missing, undersized or misaligned", resource_info->resourceId);
++         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++         return;
++      }
++      args->ret = dev->GetMemoryHostPointerPropertiesEXT(
++         dev->base.handle.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++         host_ram_res->u.data, &resource_host_props);
++      if (args->ret != VK_SUCCESS) {
++         vkr_log("guest RAM host pointer query failed: %d", args->ret);
++         return;
++      }
++      if (!(resource_host_props.memoryTypeBits & (1u << mem_type_index))) {
++         vkr_log("guest RAM memory type %u is outside supported mask %#x",
++                 mem_type_index, resource_host_props.memoryTypeBits);
++         args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
++         return;
++      }
++      local_resource_host_import = (VkImportMemoryHostPointerInfoEXT){
++         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
++         .pNext = resource_info->pNext,
++         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++         .pHostPointer = host_ram_res->u.data,
++      };
++      resource_node->pNext = (const struct VkBaseInStructure *)&local_resource_host_import;
++      vkr_resource_ref(host_ram_res);
++   }
++
++   /* translate ordinary fd-backed VkImportMemoryResourceInfoMESA in place */
+    VkImportMemoryFdInfoKHR local_import_info = { .fd = -1 };
+    VkImportMemoryResourceInfoMESA *res_info = NULL;
+    VkBaseInStructure *prev_of_res_info = vkr_find_prev_struct(
+       alloc_info, VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+-   if (prev_of_res_info) {
++   if (prev_of_res_info && !host_ram_res) {
+       res_info = (VkImportMemoryResourceInfoMESA *)prev_of_res_info->pNext;
+       if (!vkr_get_fd_info_from_resource_info(ctx, res_info, &local_import_info)) {
+          args->ret = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+@@ -350,7 +402,7 @@
+     * and is otherwise left to fall through to a host that supports no fd handle
+     * type at all.
+     */
+-   const bool force_shm_import = physical_dev->is_dma_buf_emulated && !res_info &&
++   const bool force_shm_import = physical_dev->is_dma_buf_emulated && !res_info && !host_ram_res &&
+                                  ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+                                   might_export);
+ 
+@@ -398,7 +450,7 @@
+       alloc_info->pNext = &local_host_import;
+       alloc_info->allocationSize = shm->size;
+       valid_fd_types = 1 << VIRGL_RESOURCE_FD_SHM;
+-   } else if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
++   } else if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info && !host_ram_res) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+        * If the client driver is using external memory and requesting dma_buf, without
+        * dma_buf fd export support, we must use gbm bo import path instead of forcing
+@@ -485,6 +537,10 @@
+ 
+    struct vkr_device_memory *mem = vkr_device_memory_create_and_add(ctx, args);
+    if (!mem) {
++      if (host_ram_res) {
++         vkr_log("Vulkan rejected guest RAM resource allocation: %d", args->ret);
++         vkr_resource_unref(host_ram_res);
++      }
+       if (local_import_info.fd >= 0)
+          close(local_import_info.fd);
+       if (gbm_bo)
+@@ -494,6 +550,7 @@
+    }
+ 
+    mem->device = dev;
++   mem->resource = host_ram_res;
+    mem->might_export = might_export;
+    mem->property_flags = property_flags;
+    mem->valid_fd_types = valid_fd_types;
+@@ -614,6 +671,8 @@
+ void
+ vkr_device_memory_release(struct vkr_device_memory *mem)
+ {
++   if (mem->resource)
++      vkr_resource_unref(mem->resource);
+    vkr_shm_free(mem->shm);
+    if (mem->gbm_bo)
+       vkr_gbm_bo_destroy(mem->gbm_bo);
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -9,6 +9,7 @@
+ #include "vkr_common.h"
+ 
+ struct gbm_bo;
++struct vkr_resource;
+ /* POSIX shm imported as host memory, backing memory the guest can map */
+ struct vkr_shm {
+    int fd;
+@@ -35,6 +36,9 @@
+    /* shm imported as host memory when the host cannot export an fd */
+    struct vkr_shm *shm;
+ 
++   /* Host pointer imported from a designated guest-RAM resource. */
++   struct vkr_resource *resource;
++
+    uint64_t allocation_size;
+    uint32_t memory_type_index;
+ 
+--- /dev/null
++++ b/src/venus/vkr_pm.c
+@@ -0,0 +1,235 @@
++// SPDX-License-Identifier: MIT
++
++#include <errno.h>
++#include <inttypes.h>
++
++#include "vkr_context.h"
++#include "vkr_device.h"
++#include "vkr_instance.h"
++#include "vkr_physical_device.h"
++#include "vkr_queue.h"
++#include "vkr_ring.h"
++
++static int
++pm_result(VkResult result)
++{
++   switch (result) {
++   case VK_SUCCESS: return 0;
++   case VK_NOT_READY: return EAGAIN;
++   case VK_ERROR_DEVICE_LOST: return ENODEV;
++   case VK_ERROR_OUT_OF_DEVICE_MEMORY:
++   case VK_ERROR_OUT_OF_HOST_MEMORY: return ENOMEM;
++   default: return EIO;
++   }
++}
++
++static bool
++queue_can_probe(const struct vkr_queue *queue)
++{
++   const struct vkr_physical_device *physical = queue->device->physical_device;
++   if (queue->flags || queue->family >= physical->queue_family_property_count)
++      return false;
++   const VkQueueFamilyProperties *family = &physical->queue_family_properties[queue->family];
++   return family->timestampValidBits &&
++      (family->queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT));
++}
++
++static void
++queue_free_probe(struct vkr_queue *queue)
++{
++   const struct vkr_device *dev = queue->device;
++   const struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++   if (queue->pm.pool)
++      vk->DestroyCommandPool(device, queue->pm.pool, NULL);
++   if (queue->pm.query)
++      vk->DestroyQueryPool(device, queue->pm.query, NULL);
++   queue->pm.pool = VK_NULL_HANDLE;
++   queue->pm.query = VK_NULL_HANDLE;
++   queue->pm.command = VK_NULL_HANDLE;
++}
++
++void
++vkr_queue_pm_fini(struct vkr_queue *queue)
++{
++   queue_free_probe(queue);
++   if (queue->pm.fence)
++      queue->device->proc_table.DestroyFence(queue->device->base.handle.device,
++                                           queue->pm.fence, NULL);
++}
++
++static VkResult
++queue_create_probe(struct vkr_queue *queue)
++{
++   const struct vkr_device *dev = queue->device;
++   const struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++   VkQueryPool query;
++   VkResult result = vk->CreateQueryPool(device, &(VkQueryPoolCreateInfo){
++      .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++      .queryType = VK_QUERY_TYPE_TIMESTAMP,
++      .queryCount = 1,
++   }, NULL, &query);
++   if (result != VK_SUCCESS)
++      return result;
++   queue->pm.query = query;
++
++   VkCommandPool pool;
++   result = vk->CreateCommandPool(device, &(VkCommandPoolCreateInfo){
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .queueFamilyIndex = queue->family,
++   }, NULL, &pool);
++   if (result == VK_SUCCESS) {
++      queue->pm.pool = pool;
++      result = vk->AllocateCommandBuffers(device, &(VkCommandBufferAllocateInfo){
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++         .commandPool = pool,
++         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++         .commandBufferCount = 1,
++      }, &queue->pm.command);
++   }
++   if (result == VK_SUCCESS)
++      result = vk->BeginCommandBuffer(queue->pm.command, &(VkCommandBufferBeginInfo){
++         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      });
++   if (result == VK_SUCCESS) {
++      vk->CmdResetQueryPool(queue->pm.command, query, 0, 1);
++      vk->CmdWriteTimestamp(queue->pm.command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, query, 0);
++      result = vk->EndCommandBuffer(queue->pm.command);
++   }
++   if (result != VK_SUCCESS)
++      queue_free_probe(queue);
++   return result;
++}
++
++static int
++queue_check(struct vkr_queue *queue, uint64_t transition, bool verify)
++{
++   const struct vkr_device *dev = queue->device;
++   const struct vn_device_proc_table *vk = &dev->proc_table;
++   VkDevice device = dev->base.handle.device;
++   VkResult result;
++
++   if (queue->pm.transition) {
++      result = vk->GetFenceStatus(device, queue->pm.fence);
++      if (result != VK_SUCCESS)
++         return pm_result(result);
++      if (queue->pm.transition == transition && queue->pm.verify == verify) {
++         if (!verify)
++            return 0;
++         uint64_t timestamp;
++         result = vk->GetQueryPoolResults(device, queue->pm.query, 0, 1,
++                                          sizeof(timestamp), &timestamp,
++                                          sizeof(timestamp), VK_QUERY_RESULT_64_BIT);
++         if (result == VK_SUCCESS && !queue->pm.reported) {
++            vkr_log("Venus PM GPU timestamp transition=%" PRIu64 " family=%u queue=%u value=%" PRIu64,
++                    transition, queue->family, queue->index, timestamp);
++            queue->pm.reported = true;
++         }
++         return pm_result(result);
++      }
++   }
++
++   if (queue->pm.fence) {
++      result = vk->ResetFences(device, 1, &queue->pm.fence);
++   } else {
++      VkFence fence;
++      result = vk->CreateFence(device, &(VkFenceCreateInfo){
++         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++      }, NULL, &fence);
++      if (result == VK_SUCCESS)
++         queue->pm.fence = fence;
++   }
++   if (result != VK_SUCCESS)
++      return pm_result(result);
++
++   queue->pm.transition = 0;
++   const VkSubmitInfo probe = {
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &queue->pm.command,
++   };
++   mtx_lock(&queue->vk_mutex);
++   result = vk->QueueSubmit(queue->base.handle.queue, verify ? 1 : 0,
++                            verify ? &probe : NULL, queue->pm.fence);
++   mtx_unlock(&queue->vk_mutex);
++   if (result != VK_SUCCESS)
++      return pm_result(result);
++   queue->pm.transition = transition;
++   queue->pm.verify = verify;
++   queue->pm.reported = false;
++   return EAGAIN;
++}
++
++static int
++check_rings(struct vkr_context *ctx)
++{
++   int error = 0;
++   mtx_lock(&ctx->ring_mutex);
++   list_for_each_entry (struct vkr_ring, ring, &ctx->rings, head) {
++      uint32_t tail = atomic_load_explicit(ring->control.tail, memory_order_acquire);
++      if (vkr_ring_load_head(ring) != tail) {
++         error = EAGAIN;
++         break;
++      }
++   }
++   mtx_unlock(&ctx->ring_mutex);
++   return error;
++}
++
++static int
++check_device(struct vkr_device *dev, uint64_t transition, bool verify)
++{
++   struct vkr_queue *probe = NULL;
++   list_for_each_entry (struct vkr_queue, queue, &dev->queues, base.track_head) {
++      if (queue_can_probe(queue)) {
++         probe = queue;
++         break;
++      }
++   }
++   if (!probe)
++      return ENOTSUP;
++   if (!probe->pm.command) {
++      const int error = pm_result(queue_create_probe(probe));
++      if (error)
++         return error;
++   }
++   if (verify)
++      return queue_check(probe, transition, true);
++
++   int pending = 0;
++   list_for_each_entry (struct vkr_queue, queue, &dev->queues, base.track_head) {
++      int error = queue_check(queue, transition, false);
++      if (error && error != EAGAIN)
++         return error;
++      if (error)
++         pending = error;
++   }
++   return pending;
++}
++
++int
++vkr_context_pm_check(struct vkr_context *ctx, uint64_t transition, bool verify)
++{
++   if (vkr_context_get_fatal(ctx))
++      return ENODEV;
++   int error = check_rings(ctx);
++   if (error || !ctx->instance)
++      return error;
++
++   int pending = 0;
++   struct vkr_instance *instance = ctx->instance;
++   for (uint32_t i = 0; i < instance->physical_device_count; i++) {
++      struct vkr_physical_device *physical = instance->physical_devices[i];
++      if (!physical)
++         continue;
++      list_for_each_entry (struct vkr_device, dev, &physical->devices, base.track_head) {
++         error = check_device(dev, transition, verify);
++         if (error && error != EAGAIN)
++            return error;
++         if (error)
++            pending = error;
++      }
++   }
++   return pending;
++}
+--- a/src/venus/vkr_queue.c
++++ b/src/venus/vkr_queue.c
+@@ -133,6 +133,7 @@
+ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue)
+ {
+    vkr_queue_sync_thread_fini(queue);
++   vkr_queue_pm_fini(queue);
+ 
+    list_del(&queue->base.track_head);
+ 
+--- a/src/venus/vkr_queue.h
++++ b/src/venus/vkr_queue.h
+@@ -37,6 +37,16 @@
+     */
+    mtx_t vk_mutex;
+ 
++   struct {
++      uint64_t transition;
++      VkFence fence;
++      VkQueryPool query;
++      VkCommandPool pool;
++      VkCommandBuffer command;
++      bool verify;
++      bool reported;
++   } pm;
++
+    /* Submitted fences are added to sync_thread.syncs first. With required
+     * VKR_RENDERER_THREAD_SYNC and VKR_RENDERER_ASYNC_FENCE_CB in render server, the sync
+     * thread calls vkWaitForFences and retires signaled fences in order.
+@@ -89,6 +99,9 @@
+ void
+ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
+ 
++void
++vkr_queue_pm_fini(struct vkr_queue *queue);
++
+ bool
+ vkr_queue_sync_submit(struct vkr_queue *queue,
+                       uint32_t flags,
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -5,6 +5,8 @@
+ 
+ #include "vkr_common.h"
+ 
++#include <errno.h>
++
+ #include "venus-protocol/vn_protocol_renderer_info.h"
+ #include "virtgpu_drm.h"
+ #include "venus_hw.h"
+@@ -149,6 +151,13 @@
+    vkr_context_destroy(ctx);
+ }
+ 
++int
++vkr_renderer_pm_check(uint32_t ctx_id, uint64_t transition, bool verify)
++{
++   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
++   return ctx ? vkr_context_pm_check(ctx, transition, verify) : EINVAL;
++}
++
+ bool
+ vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size)
+ {
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -44,6 +44,9 @@
+ void
+ vkr_renderer_destroy_context(uint32_t ctx_id);
+ 
++int
++vkr_renderer_pm_check(uint32_t ctx_id, uint64_t transition, bool verify);
++
+ bool
+ vkr_renderer_submit_cmd(uint32_t ctx_id, void *cmd, uint32_t size);
+ 
+--- a/src/virgl_context.h
++++ b/src/virgl_context.h
+@@ -135,6 +135,7 @@
+ 
+    /* For DRM native contexts, return the device fd: */
+    int (*get_device_fd)(struct virgl_context *ctx);
++   int (*pm_check)(struct virgl_context *ctx, uint64_t transition, bool verify);
+ 
+    /* map a resource into a particular address */
+    void * (*resource_map)(struct virgl_context *ctx,
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -301,6 +301,14 @@
+ {
+    TRACE_FUNC();
+    virgl_context_remove(handle);
++}
++
++int virgl_renderer_context_pm_check(uint32_t ctx_id, uint64_t transition, bool verify)
++{
++   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
++   if (!ctx || !transition)
++      return EINVAL;
++   return ctx->pm_check ? ctx->pm_check(ctx, transition, verify) : ENOTSUP;
+ }
+ 
+ int virgl_renderer_submit_cmd(void *buffer,
+--- a/src/virglrenderer.h
++++ b/src/virglrenderer.h
+@@ -306,6 +306,8 @@
+  * concurrent modification of the buffer by other threads while it
+  * is running.
+  */
++VIRGL_EXPORT int virgl_renderer_context_pm_check(uint32_t ctx_id, uint64_t transition, bool verify);
++
+ VIRGL_EXPORT int virgl_renderer_submit_cmd(void *buffer,
+                                            int ctx_id,
+                                            int ndw);

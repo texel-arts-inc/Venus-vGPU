@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m += apple_dma.o venus_ivshmem.o rv_guest_pool.o
+apple_dma-y := apple_dma_main.o apple_dma_trace.o \
+	quirks/dczid_patch.o quirks/tso_patch.o quirks/uvm_page_patch.o

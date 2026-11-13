@@ -1,0 +1,17 @@
+(type venus_pm_device_t)
+(roletype object_r venus_pm_device_t)
+
+(allow venus_pm_device_t device_t (filesystem (associate)))
+(allow init_t venus_pm_device_t (chr_file (getattr open read write ioctl map)))
+(allow udev_t venus_pm_device_t (chr_file (create getattr setattr write relabelto)))
+(allow setfiles_t venus_pm_device_t (chr_file (getattr relabelto)))
+(allow unconfined_t venus_pm_device_t (chr_file (getattr open read write ioctl map)))
+
+(context venus_pm_device_context (system_u object_r venus_pm_device_t ((s0) (s0))))
+(filecon "/dev/venus-ivshmem" char venus_pm_device_context)
+(filecon "/dev/rv-guest-pool" char venus_pm_device_context)
+(filecon "/dev/nvidia0" char venus_pm_device_context)
+(filecon "/dev/nvidiactl" char venus_pm_device_context)
+(filecon "/dev/nvidia-modeset" char venus_pm_device_context)
+(filecon "/dev/nvidia-uvm" char venus_pm_device_context)
+(filecon "/dev/nvidia-uvm-tools" char venus_pm_device_context)
