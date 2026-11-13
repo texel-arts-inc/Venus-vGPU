@@ -46,3 +46,11 @@ Khronos VK-GL-CTS contributors and Google Inc.
   licensed under Apache-2.0. The CTS source and binaries are fetched and
   built separately. See the upstream license and source notices.
 
+Ollama and llama.cpp contributors
+  The optional inference runner builds Ollama and its pinned llama.cpp
+  dependency. See the respective upstream MIT licenses and the notices
+  for dependencies in the staged lib/ollama directory.
+
+NVIDIA is credited for the optional NVIDIA GPU driver and firmware.
+Those artifacts are fetched from NVIDIA or supplied locally by the user
+under their own terms. They are separate from this source distribution.

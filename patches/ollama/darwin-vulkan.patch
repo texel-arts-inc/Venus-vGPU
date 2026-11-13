@@ -1,0 +1,99 @@
+diff --git a/cmake/local.cmake b/cmake/local.cmake
+index 3c7d18f..fcf3b02 100644
+--- a/cmake/local.cmake
++++ b/cmake/local.cmake
+@@ -729,7 +729,7 @@ if(OLLAMA_HAVE_LLAMA_SERVER)
+     endif()
+ 
+     set(_cpu_args)
+-    if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
++    if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND NOT OLLAMA_LLAMA_BACKENDS STREQUAL "vulkan")
+         list(APPEND _cpu_args
+             -DBUILD_SHARED_LIBS=OFF
+             -DGGML_BACKEND_DL=OFF
+diff --git a/discover/gpu_darwin.go b/discover/gpu_darwin.go
+index fa4396e..3da3947 100644
+--- a/discover/gpu_darwin.go
++++ b/discover/gpu_darwin.go
+@@ -2,7 +2,7 @@ package discover
+ 
+ /*
+ #cgo CFLAGS: -x objective-c
+-#cgo LDFLAGS: -framework Foundation -framework CoreGraphics -framework Metal
++#cgo LDFLAGS: -framework Foundation -framework CoreGraphics
+ #include "gpu_info_darwin.h"
+ */
+ import "C"
+diff --git a/discover/gpu_info_darwin.h b/discover/gpu_info_darwin.h
+index 415e792..e2d2864 100644
+--- a/discover/gpu_info_darwin.h
++++ b/discover/gpu_info_darwin.h
+@@ -1,5 +1,3 @@
+-#import <Metal/Metal.h>
+ #include <stdint.h>
+-uint64_t getRecommendedMaxVRAM();
+ uint64_t getPhysicalMemory();
+ uint64_t getFreeMemory();
+diff --git a/discover/gpu_info_darwin.m b/discover/gpu_info_darwin.m
+index f630178..9b94501 100644
+--- a/discover/gpu_info_darwin.m
++++ b/discover/gpu_info_darwin.m
+@@ -2,13 +2,6 @@
+ #import <mach/mach.h>
+ #include "gpu_info_darwin.h"
+ 
+-uint64_t getRecommendedMaxVRAM() {
+-  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+-  uint64_t result = device.recommendedMaxWorkingSetSize;
+-  CFRelease(device);
+-  return result;
+-}
+-
+ // getPhysicalMemory returns the total physical memory in bytes
+ uint64_t getPhysicalMemory() {
+   return [NSProcessInfo processInfo].physicalMemory;
+diff --git a/mlx/mlx.go b/mlx/mlx.go
+index a4c007c..0f60629 100644
+--- a/mlx/mlx.go
++++ b/mlx/mlx.go
+@@ -10,7 +10,7 @@ package mlx
+ // #cgo CXXFLAGS: -std=c++17
+ // #cgo CPPFLAGS: -I${SRCDIR}/include
+ // #cgo LDFLAGS: -lstdc++
+-// #cgo darwin LDFLAGS: -framework Foundation -framework Metal -framework Accelerate
++// #cgo darwin LDFLAGS: -framework Foundation -framework Accelerate
+ // #include "generated.h"
+ // #include <string.h>
+ //
+diff --git a/cmake/local.cmake b/cmake/local.cmake
+--- a/cmake/local.cmake
++++ b/cmake/local.cmake
+@@ -154,6 +154,10 @@ else()
+             CONFIGURE_COMMAND ""
+             BUILD_COMMAND ""
+             INSTALL_COMMAND ""
++            PATCH_COMMAND ${CMAKE_COMMAND}
++                "-DSOURCE_DIR=<SOURCE_DIR>" "-DGIT=${GIT_EXECUTABLE}"
++                "-DEXPECTED=6c01da6278ab6c69ed67d9124806b50d2b299ba7"
++                -P "${VENUS_VERIFY_REVISION}"
+-            PATCH_COMMAND ${OLLAMA_LLAMA_CPP_COMPAT_PATCH_COMMAND}
++            COMMAND ${OLLAMA_LLAMA_CPP_COMPAT_PATCH_COMMAND}
+             USES_TERMINAL_DOWNLOAD TRUE
+             USES_TERMINAL_PATCH TRUE)
+@@ -464,6 +468,8 @@ function(ollama_add_llama_server_build name)
+     endif()
+     ollama_collect_cache_args_with_prefix("GGML_" _ggml_cache_args)
+     ollama_collect_cache_args_with_prefix("LLAMA_" _llama_cache_args)
++    ollama_collect_cache_args_with_prefix("Vulkan_" _vulkan_cache_args)
++    ollama_append_cache_arg_if_set(_vulkan_cache_args SPIRV-Headers_DIR)
+     set(_cmake_args
+         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+         -DCMAKE_INSTALL_PREFIX=${OLLAMA_PAYLOAD_INSTALL_PREFIX}
+@@ -475,6 +481,7 @@ function(ollama_add_llama_server_build name)
+         ${ARG_CMAKE_ARGS}
+         ${_ggml_cache_args}
+         ${_llama_cache_args}
++        ${_vulkan_cache_args}
+     )
+ 
+     if(APPLE)

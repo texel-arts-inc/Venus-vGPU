@@ -1,0 +1,61 @@
+diff --git a/discover/llama_server.go b/discover/llama_server.go
+index ba8ace5..e248289 100644
+--- a/discover/llama_server.go
++++ b/discover/llama_server.go
+@@ -311,7 +311,15 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+ 			}
+ 		}
+ 
+-		nativeDevice, hasNativeDevice := nativeByIndex[library][deviceIndex]
++		backendIndex := deviceIndex
++		if library == "Vulkan" {
++			// The Vulkan filter uses backend ordinals. Device list positions can
++			// include CPU math devices such as Accelerate before Vulkan0.
++			if ordinal, err := strconv.Atoi(strings.TrimPrefix(name, "Vulkan")); err == nil {
++				backendIndex = ordinal
++			}
++		}
++		nativeDevice, hasNativeDevice := nativeByIndex[library][backendIndex]
+ 		totalBytes := totalMiB * 1024 * 1024
+ 		if hasNativeDevice && !nativeProbeMatchesLlamaServerDevice(library, description, totalBytes, nativeDevice) {
+ 			hasNativeDevice = false
+@@ -319,7 +327,7 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+ 		computeMajor, computeMinor := computeVersion(library, deviceIndex, gfxByIndex, ccByIndex)
+ 		dev := ml.DeviceInfo{
+ 			DeviceID: ml.DeviceID{
+-				ID:      strconv.Itoa(deviceIndex),
++				ID:      strconv.Itoa(backendIndex),
+ 				Library: library,
+ 			},
+ 			Name:         name,
+@@ -330,7 +338,7 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
+ 			ComputeMinor: computeMinor,
+ 			LibraryPath:  libDirs,
+ 			GFXTarget:    gfxByIndex[deviceIndex],
+-			Integrated:   isIntegratedLlamaServerDevice(library, deviceIndex, integratedByIndex),
++			Integrated:   isIntegratedLlamaServerDevice(library, backendIndex, integratedByIndex),
+ 		}
+ 		if hasNativeDevice {
+ 			if nativeDevice.DeviceID != "" {
+diff --git a/discover/llama_server_test.go b/discover/llama_server_test.go
+index 0418dc2..b84a15b 100644
+--- a/discover/llama_server_test.go
++++ b/discover/llama_server_test.go
+@@ -37,6 +37,17 @@ func TestLlamaServerDiscovery(t *testing.T) {
+ 		}
+ 	})
+ 
++	t.Run("Vulkan ordinal excludes CPU math device", func(t *testing.T) {
++		output := `Available devices:
++  BLAS: Accelerate (0 MiB, 0 MiB free)
++  Vulkan0: Virtio-GPU Venus (NVIDIA RTX 4000 SFF Ada Generation) (20475 MiB, 20000 MiB free)
++`
++		devices := parseLlamaServerDevicesWithNative(output, "", []string{"/lib/ollama", "/lib/ollama/vulkan"}, nil)
++		if len(devices) != 1 || devices[0].ID != "0" || devices[0].Library != "Vulkan" {
++			t.Fatalf("expected Vulkan ordinal 0, got %+v", devices)
++		}
++	})
++
+ 	t.Run("parse devices", func(t *testing.T) {
+ 		type wantDevice struct {
+ 			name            string

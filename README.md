@@ -51,6 +51,16 @@ cmake -S . -B build-demo -G Ninja -DVENUS_BUILD_HOST=OFF -DVENUS_BUILD_DEMO=ON
 cmake --build build-demo
 ```
 
+### Ollama
+
+Build the [native Ollama Vulkan runner](inference/README.md) to run local
+inference on a GPU assigned to the Venus guest.
+
+```sh
+cmake -S . -B build-inference -G Ninja -DVENUS_BUILD_HOST=OFF -DVENUS_BUILD_OLLAMA=ON
+cmake --build build-inference --target venus-ollama
+```
+
 ## Guest driver choices
 
 | Selection | Guest driver | Status |
