@@ -41,6 +41,8 @@ SDL, Khronos, glslang and libpng contributors
   The demo uses SDL3, the Vulkan loader and headers, glslang, and libpng.
   Refer to the license notices supplied by the corresponding packages.
 
-NVIDIA is credited for the optional NVIDIA GPU driver and firmware.
-Those artifacts are fetched from NVIDIA or supplied locally by the user
-under their own terms. They are separate from this source distribution.
+Khronos VK-GL-CTS contributors and Google Inc.
+  The optional legacy swapchain support-check patch modifies CTS source
+  licensed under Apache-2.0. The CTS source and binaries are fetched and
+  built separately. See the upstream license and source notices.
+

@@ -1,0 +1,12 @@
+--- a/external/vulkancts/modules/vulkan/wsi/vktWsiSwapchainTests.cpp
++++ b/external/vulkancts/modules/vulkan/wsi/vktWsiSwapchainTests.cpp
+@@ -601,7 +601,8 @@
+     commonCheckSupport(context, params.wsiType);
+ 
+     context.requireDeviceFunctionality("VK_EXT_attachment_feedback_loop_layout");
+-    context.requireDeviceFunctionality("VK_KHR_extended_flags");
++    if (params.extendedFlags)
++        context.requireDeviceFunctionality("VK_KHR_extended_flags");
+ }
+ 
+ tcu::TestStatus createSwapchainTest(Context &context, TestParameters params)
