@@ -1,0 +1,4727 @@
+diff --git a/Kconfig.host b/Kconfig.host
+index 933425c74b..bb2780293c 100644
+--- a/Kconfig.host
++++ b/Kconfig.host
+@@ -5,6 +5,9 @@
+ config LINUX
+     bool
+ 
++config DARWIN
++    bool
++
+ config LIBCBOR
+     bool
+ 
+diff --git a/accel/hvf/hvf-accel-ops.c b/accel/hvf/hvf-accel-ops.c
+index d2276d8513..974307da77 100644
+--- a/accel/hvf/hvf-accel-ops.c
++++ b/accel/hvf/hvf-accel-ops.c
+@@ -160,6 +160,18 @@ static void *hvf_cpu_thread_fn(void *arg)
+ 
+     rcu_register_thread();
+ 
++    /*
++     * QoS USER_INTERACTIVE biases the scheduler toward P-cores.
++     * SCHED_RR at max priority gives real-time round-robin scheduling.
++     */
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++
++    {
++        struct sched_param param;
++        param.sched_priority = sched_get_priority_max(SCHED_RR);
++        pthread_setschedparam(pthread_self(), SCHED_RR, &param);
++    }
++
+     bql_lock();
+     qemu_thread_get_self(cpu->thread);
+ 
+diff --git a/accel/hvf/hvf-all.c b/accel/hvf/hvf-all.c
+index 8bd9154a50..429b31758e 100644
+--- a/accel/hvf/hvf-all.c
++++ b/accel/hvf/hvf-all.c
+@@ -124,7 +124,15 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
+         return;
+     }
+ 
+-    flags = HV_MEMORY_READ | HV_MEMORY_EXEC | (writable ? HV_MEMORY_WRITE : 0);
++    flags = HV_MEMORY_READ | (writable ? HV_MEMORY_WRITE : 0);
++    /*
++     * Leave RAM-device/MMIO mappings RW-only: on macOS, accessing them through
++     * executable HVF mappings can panic the host kernel. Ordinary guest RAM
++     * still needs EXEC.
++     */
++    if (!memory_region_is_ram_device(area)) {
++        flags |= HV_MEMORY_EXEC;
++    }
+     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
+ 
+     trace_hvf_vm_map(gpa, size, mem, flags,
+@@ -269,6 +277,7 @@ static void hvf_set_kernel_irqchip(Object *obj, Visitor *v,
+     }
+ }
+ 
++
+ static void hvf_accel_class_init(ObjectClass *oc, const void *data)
+ {
+     AccelClass *ac = ACCEL_CLASS(oc);
+diff --git a/backends/Kconfig b/backends/Kconfig
+index d3dbe19868..d1be4148d3 100644
+--- a/backends/Kconfig
++++ b/backends/Kconfig
+@@ -2,7 +2,7 @@ source tpm/Kconfig
+ 
+ config IOMMUFD
+     bool
+-    depends on VFIO
++    depends on VFIO && LINUX
+ 
+ config SPDM_SOCKET
+     bool
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index 219597cabd..14349c264d 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -97,6 +97,10 @@
+ #include "qemu/guest-random.h"
+ #include "hw/watchdog/sbsa_gwdt.h"
+ 
++#ifdef CONFIG_DARWIN
++#include "hw/vfio/apple.h"
++#endif
++
+ static GlobalProperty arm_virt_compat_defaults[] = {
+     { TYPE_VIRTIO_IOMMU_PCI, "aw-bits", "48" },
+ };
+@@ -2440,6 +2444,18 @@ void virt_machine_done(Notifier *notifier, void *data)
+                                        vms->memmap[VIRT_PLATFORM_BUS].size,
+                                        vms->irqmap[VIRT_PLATFORM_BUS]);
+     }
++#ifdef CONFIG_DARWIN
++    if (info->dtb_filename == NULL && vms->pciehb_nodename) {
++        apple_vfio_add_bounce_fdt_nodes(ms->fdt, vms->pciehb_nodename);
++    }
++    if (!QLIST_EMPTY(apple_vfio_get_bounce_buffers()) &&
++        virt_is_acpi_enabled(vms)) {
++        error_report("vfio-apple: DMA bounce buffers require device tree "
++                     "(use -machine acpi=off)");
++        exit(1);
++    }
++#endif
++
+     if (arm_load_dtb(info->dtb_start, info, info->dtb_limit, as, ms, cpu) < 0) {
+         exit(1);
+     }
+diff --git a/hw/vfio-user/device.c b/hw/vfio-user/device.c
+index 1a01e748cd..b19ed1ac89 100644
+--- a/hw/vfio-user/device.c
++++ b/hw/vfio-user/device.c
+@@ -12,6 +12,7 @@
+ #include "qemu/lockable.h"
+ #include "qemu/thread.h"
+ 
++#include "hw/vfio/vfio-region.h"
+ #include "hw/vfio-user/device.h"
+ #include "hw/vfio-user/trace.h"
+ 
+@@ -515,6 +516,18 @@ static int vfio_user_device_io_region_write(VFIODevice *vbasedev, uint8_t index,
+     return ret;
+ }
+ 
++static int vfio_user_device_io_region_map(VFIODevice *vbasedev,
++                                          VFIORegion *region)
++{
++    return vfio_region_mmap_fd(region);
++}
++
++static void vfio_user_device_io_region_unmap(VFIODevice *vbasedev,
++                                             VFIORegion *region)
++{
++    vfio_region_unmap_fd(region);
++}
++
+ /*
+  * Socket-based io_ops
+  */
+@@ -525,5 +538,6 @@ VFIODeviceIOOps vfio_user_device_io_ops_sock = {
+     .set_irqs = vfio_user_device_io_set_irqs,
+     .region_read = vfio_user_device_io_region_read,
+     .region_write = vfio_user_device_io_region_write,
+-
++    .region_map = vfio_user_device_io_region_map,
++    .region_unmap = vfio_user_device_io_region_unmap,
+ };
+diff --git a/hw/vfio/Kconfig b/hw/vfio/Kconfig
+index 27de24e4db..a409483c34 100644
+--- a/hw/vfio/Kconfig
++++ b/hw/vfio/Kconfig
+@@ -2,14 +2,14 @@
+ 
+ config VFIO
+     bool
+-    depends on LINUX
++    depends on LINUX || DARWIN
+ 
+ config VFIO_PCI
+     bool
+     default y
+     select VFIO
+     select EDID
+-    depends on LINUX && PCI
++    depends on (LINUX || DARWIN) && PCI
+ 
+ config VFIO_CCW
+     bool
+diff --git a/hw/vfio/ap.c b/hw/vfio/ap.c
+index 2926e04ad4..525702fa9c 100644
+--- a/hw/vfio/ap.c
++++ b/hw/vfio/ap.c
+@@ -292,10 +292,10 @@ static void vfio_ap_reset(DeviceState *dev)
+     int ret;
+     VFIOAPDevice *vapdev = VFIO_AP_DEVICE(dev);
+ 
+-    ret = ioctl(vapdev->vdev.fd, VFIO_DEVICE_RESET);
++    ret = vapdev->vdev.io_ops->device_reset(&vapdev->vdev);
+     if (ret) {
+         error_report("%s: failed to reset %s device: %s", __func__,
+-                     vapdev->vdev.name, strerror(errno));
++                     vapdev->vdev.name, strerror(-ret));
+     }
+ }
+ 
+diff --git a/hw/vfio/apple-device.c b/hw/vfio/apple-device.c
+new file mode 100644
+index 0000000000..bab864006a
+--- /dev/null
++++ b/hw/vfio/apple-device.c
+@@ -0,0 +1,1155 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Apple/macOS VFIO PCI device passthrough via DriverKit dext.
++ *
++ * Copyright (c) 2026 Scott J. Goldman
++ */
++
++#include "qemu/osdep.h"
++
++#include <errno.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <linux/vfio.h>
++
++#include "apple-dext-client.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/vfio/apple.h"
++#include "hw/vfio/vfio-container.h"
++#include "qapi/error.h"
++#include "qemu/error-report.h"
++#include "qemu/host-pci-mmio.h"
++#include "qemu/main-loop.h"
++#include "qemu/units.h"
++
++typedef struct AppleVFIOSharedDext {
++    io_connect_t conn;
++    uint32_t refs;
++} AppleVFIOSharedDext;
++
++typedef struct AppleVFIODMAProbe {
++    uint64_t managed_bdf;
++    uint64_t host_bus;
++    uint64_t host_device;
++    uint64_t host_function;
++    DeviceState *match;
++} AppleVFIODMAProbe;
++
++static GHashTable *apple_vfio_shared_dexts;
++
++/*
++ * Cache key for shared dext connections. Encodes BDF plus the host root
++ * name (or "" if unspecified) so two devices with the same BDF under
++ * different roots stay in distinct cache entries.
++ */
++static gchar *apple_vfio_dext_key(uint8_t bus, uint8_t device,
++                                  uint8_t function, const char *host_root)
++{
++    return g_strdup_printf("%02x:%02x.%x@%s",
++                           bus, device, function,
++                           host_root ? host_root : "");
++}
++
++static inline AppleVFIOContainer *apple_vfio_container(VFIODevice *vbasedev)
++{
++    return VFIO_IOMMU_APPLE(vbasedev->bcontainer);
++}
++
++static inline io_connect_t apple_vfio_connection(VFIODevice *vbasedev)
++{
++    AppleVFIOContainer *container = apple_vfio_container(vbasedev);
++
++    return container ? container->dext_conn : IO_OBJECT_NULL;
++}
++
++static void apple_vfio_find_dma_companion_cb(PCIBus *bus, PCIDevice *pdev,
++                                             void *opaque)
++{
++    AppleVFIODMAProbe *probe = opaque;
++    Error *err = NULL;
++    uint64_t managed_bdf;
++    uint64_t host_bus;
++    uint64_t host_device;
++    uint64_t host_function;
++
++    if (probe->match ||
++        !object_dynamic_cast(OBJECT(pdev), "apple-dma-pci")) {
++        return;
++    }
++
++    managed_bdf = object_property_get_uint(OBJECT(pdev), "managed-bdf", &err);
++    if (err) {
++        error_free(err);
++        return;
++    }
++
++    host_bus = object_property_get_uint(OBJECT(pdev), "x-apple-host-bus", &err);
++    if (err) {
++        error_free(err);
++        return;
++    }
++
++    host_device = object_property_get_uint(OBJECT(pdev),
++                                           "x-apple-host-device", &err);
++    if (err) {
++        error_free(err);
++        return;
++    }
++
++    host_function = object_property_get_uint(OBJECT(pdev),
++                                             "x-apple-host-function", &err);
++    if (err) {
++        error_free(err);
++        return;
++    }
++
++    if (managed_bdf == probe->managed_bdf &&
++        host_bus == probe->host_bus &&
++        host_device == probe->host_device &&
++        host_function == probe->host_function) {
++        probe->match = DEVICE(pdev);
++    }
++}
++
++static DeviceState *apple_vfio_find_dma_companion(VFIOApplePCIDevice *adev)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    PCIDevice *pdev = PCI_DEVICE(vdev);
++    AppleVFIODMAProbe probe = {
++        .managed_bdf = PCI_BUILD_BDF(pci_dev_bus_num(pdev), pdev->devfn),
++        .host_bus = vdev->host.bus,
++        .host_device = vdev->host.slot,
++        .host_function = vdev->host.function,
++    };
++
++    pci_for_each_device_under_bus(pci_device_root_bus(pdev),
++                                  apple_vfio_find_dma_companion_cb, &probe);
++    return probe.match;
++}
++
++static void apple_vfio_signal_irqfd(int fd)
++{
++    static const uint64_t value = 1;
++    ssize_t ret;
++
++    if (fd < 0) {
++        return;
++    }
++
++    do {
++        ret = write(fd, &value, sizeof(value));
++    } while (ret < 0 && errno == EINTR);
++}
++
++static void apple_vfio_deliver_irq(VFIOPCIDevice *vdev, uint32_t vector)
++{
++    switch (vdev->interrupt) {
++    case VFIO_INT_MSI:
++    case VFIO_INT_MSIX:
++        if (vector < vdev->nr_vectors && vdev->msi_vectors[vector].use) {
++            apple_vfio_signal_irqfd(
++                event_notifier_get_wfd(&vdev->msi_vectors[vector].interrupt));
++        }
++        break;
++    case VFIO_INT_INTx:
++        apple_vfio_signal_irqfd(
++            event_notifier_get_wfd(&vdev->intx.interrupt));
++        break;
++    default:
++        break;
++    }
++}
++
++/*
++ * Called on a GCD dispatch queue when the dext signals pending interrupts.
++ * Just pokes the EventNotifier to wake the QEMU main loop.
++ */
++static void apple_vfio_irq_wakeup(void *opaque)
++{
++    VFIOApplePCIDevice *adev = opaque;
++
++    event_notifier_set(&adev->apple->irq_notifier);
++}
++
++/*
++ * QEMU main-loop fd handler: drain the pending-interrupt bitfield from
++ * the dext, deliver each flagged vector, then re-arm the async wait.
++ */
++static void apple_vfio_irq_handler(void *opaque)
++{
++    VFIOApplePCIDevice *adev = opaque;
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    VFIODevice *vbasedev = &vdev->vbasedev;
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    AppleVFIOState *apple = adev->apple;
++    uint64_t pending[4];
++    int word;
++
++    if (!event_notifier_test_and_clear(&apple->irq_notifier)) {
++        return;
++    }
++
++    if (conn == IO_OBJECT_NULL) {
++        return;
++    }
++
++    if (apple_dext_read_pending_irqs(conn, pending) != KERN_SUCCESS) {
++        apple_dext_interrupt_notify_rearm(apple->irq_notify);
++        return;
++    }
++
++    for (word = 0; word < 4; word++) {
++        uint64_t bits = pending[word];
++
++        while (bits) {
++            int bit = __builtin_ctzll(bits);
++            uint32_t vector = word * 64 + bit;
++
++            apple_vfio_deliver_irq(vdev, vector);
++            bits &= bits - 1;
++        }
++    }
++
++    apple_dext_interrupt_notify_rearm(apple->irq_notify);
++}
++
++bool apple_vfio_get_bar_info(VFIOApplePCIDevice *adev, uint8_t bar,
++                             uint8_t *mem_idx, uint64_t *size,
++                             uint8_t *type)
++{
++    io_connect_t conn = apple_vfio_connection(&VFIO_PCI_DEVICE(adev)->vbasedev);
++
++    if (conn != IO_OBJECT_NULL) {
++        return apple_dext_get_bar_info(conn, bar, mem_idx, size, type) ==
++               KERN_SUCCESS;
++    }
++
++    if (mem_idx) {
++        *mem_idx = 0;
++    }
++    if (size) {
++        *size = 0;
++    }
++    if (type) {
++        *type = 0;
++    }
++    return false;
++}
++
++static void apple_vfio_pci_init(VFIOApplePCIDevice *adev)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++
++    /*
++     * On macOS, HVF can only map on 16kb page boundaries, so these quirk
++     * fixes end up breaking things. Likewise the performance enhancements
++     * there rely on kvm-specific features. Disable for now, but we should
++     * revisit this.
++     */
++    vdev->no_bar_quirks = true;
++}
++
++static bool apple_vfio_pci_pre_realize(VFIOApplePCIDevice *adev, Error **errp)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    VFIODevice *vbasedev = &vdev->vbasedev;
++
++    adev->apple = g_new0(AppleVFIOState, 1);
++
++    if (!vbasedev->name) {
++        vbasedev->name = g_strdup_printf("apple-%04x:%02x:%02x.%x",
++                                         vdev->host.domain,
++                                         vdev->host.bus,
++                                         vdev->host.slot,
++                                         vdev->host.function);
++    }
++
++    return true;
++}
++
++static bool apple_vfio_create_dma_companion(VFIOApplePCIDevice *adev,
++                                            Error **errp)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    PCIDevice *pdev = PCI_DEVICE(vdev);
++    DeviceState *dev;
++
++    if (adev->dma_companion_autocreated && adev->dma_companion) {
++        return true;
++    }
++
++    if (apple_vfio_find_dma_companion(adev) != NULL) {
++        return true;
++    }
++
++    dev = qdev_new("apple-dma-pci");
++    if (!object_property_set_uint(OBJECT(dev), "managed-bdf",
++                                  PCI_BUILD_BDF(pci_dev_bus_num(pdev),
++                                                pdev->devfn), errp) ||
++        !object_property_set_uint(OBJECT(dev), "x-apple-host-bus",
++                                  vdev->host.bus, errp) ||
++        !object_property_set_uint(OBJECT(dev), "x-apple-host-device",
++                                  vdev->host.slot, errp) ||
++        !object_property_set_uint(OBJECT(dev), "x-apple-host-function",
++                                  vdev->host.function, errp)) {
++        object_unref(OBJECT(dev));
++        return false;
++    }
++
++    if (adev->host_root != NULL && adev->host_root[0] != '\0' &&
++        !object_property_set_str(OBJECT(dev), "x-apple-host-root",
++                                 adev->host_root, errp)) {
++        object_unref(OBJECT(dev));
++        return false;
++    }
++
++    if (!qdev_realize(dev, BUS(pci_get_bus(pdev)), errp)) {
++        object_unref(OBJECT(dev));
++        return false;
++    }
++
++    adev->dma_companion = dev;
++    adev->dma_companion_autocreated = true;
++    object_unref(OBJECT(dev));
++    return true;
++}
++
++static void apple_vfio_destroy_dma_companion(VFIOApplePCIDevice *adev)
++{
++    if (!adev->dma_companion_autocreated || adev->dma_companion == NULL) {
++        return;
++    }
++
++    object_unparent(OBJECT(adev->dma_companion));
++    adev->dma_companion = NULL;
++    adev->dma_companion_autocreated = false;
++}
++
++bool apple_vfio_device_setup(VFIOApplePCIDevice *adev, Error **errp)
++{
++    VFIODevice *vbasedev = &VFIO_PCI_DEVICE(adev)->vbasedev;
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    uint32_t num_vectors = 0;
++    kern_return_t kr;
++
++    if (conn == IO_OBJECT_NULL) {
++        error_setg(errp, "vfio-apple: missing dext connection");
++        return false;
++    }
++
++    kr = apple_dext_setup_interrupts(conn, &num_vectors);
++    if (kr != KERN_SUCCESS) {
++        error_setg(errp, "vfio-apple: failed to setup interrupts (kr=0x%x)",
++                   kr);
++        return false;
++    }
++
++    adev->apple->num_irq_vectors = num_vectors;
++
++    if (event_notifier_init(&adev->apple->irq_notifier, false) < 0) {
++        error_setg(errp, "vfio-apple: failed to create IRQ event notifier");
++        return false;
++    }
++
++    qemu_set_fd_handler(event_notifier_get_fd(&adev->apple->irq_notifier),
++                        apple_vfio_irq_handler, NULL, adev);
++
++    adev->apple->irq_notify =
++        apple_dext_interrupt_notify_create(conn, apple_vfio_irq_wakeup, adev);
++    if (!adev->apple->irq_notify) {
++        error_setg(errp,
++                   "vfio-apple: failed to create IRQ async notification");
++        qemu_set_fd_handler(
++            event_notifier_get_fd(&adev->apple->irq_notifier),
++            NULL, NULL, NULL);
++        event_notifier_cleanup(&adev->apple->irq_notifier);
++        return false;
++    }
++
++    return true;
++}
++
++void apple_vfio_device_cleanup(VFIOApplePCIDevice *adev)
++{
++    AppleVFIOState *apple = adev->apple;
++
++    if (!apple) {
++        return;
++    }
++
++    if (apple->irq_notify) {
++        apple_dext_interrupt_notify_destroy(apple->irq_notify);
++        apple->irq_notify = NULL;
++
++        qemu_set_fd_handler(event_notifier_get_fd(&apple->irq_notifier),
++                            NULL, NULL, NULL);
++        event_notifier_cleanup(&apple->irq_notifier);
++    }
++}
++
++static int apple_vfio_device_feature(VFIODevice *vdev,
++                                     struct vfio_device_feature *feat)
++{
++    return -ENOTTY;
++}
++
++static int apple_vfio_device_reset(VFIODevice *vbasedev)
++{
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++
++    if (conn == IO_OBJECT_NULL) {
++        return -ENODEV;
++    }
++
++    return apple_dext_reset_device(conn) == KERN_SUCCESS ? 0 : -EIO;
++}
++
++static int apple_vfio_get_region_info(VFIODevice *vbasedev,
++                                      struct vfio_region_info *info,
++                                      int *fd)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    uint32_t index = info->index;
++    uint64_t size = 0;
++
++    if (fd) {
++        *fd = -1;
++    }
++
++    memset((char *)info + offsetof(struct vfio_region_info, flags), 0,
++           sizeof(*info) - offsetof(struct vfio_region_info, flags));
++
++    info->index = index;
++    info->flags = VFIO_REGION_INFO_FLAG_READ | VFIO_REGION_INFO_FLAG_WRITE;
++    info->offset = (uint64_t)index << 20;
++
++    switch (info->index) {
++    case VFIO_PCI_BAR0_REGION_INDEX ... VFIO_PCI_BAR5_REGION_INDEX:
++        if (!apple_vfio_get_bar_info(adev, info->index, NULL, &size, NULL)) {
++            size = 0;
++        }
++        info->size = size;
++        info->flags |= VFIO_REGION_INFO_FLAG_MMAP;
++        break;
++    case VFIO_PCI_CONFIG_REGION_INDEX:
++        info->size = PCIE_CONFIG_SPACE_SIZE;
++        break;
++    case VFIO_PCI_ROM_REGION_INDEX:
++    case VFIO_PCI_VGA_REGION_INDEX:
++        info->size = 0;
++        break;
++    default:
++        return -EINVAL;
++    }
++
++    return 0;
++}
++
++static int apple_vfio_get_irq_info(VFIODevice *vbasedev,
++                                   struct vfio_irq_info *info)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++
++    switch (info->index) {
++    case VFIO_PCI_MSI_IRQ_INDEX:
++        info->flags = VFIO_IRQ_INFO_EVENTFD;
++        info->count = adev->apple->num_irq_vectors;
++        break;
++    case VFIO_PCI_MSIX_IRQ_INDEX:
++        info->flags = VFIO_IRQ_INFO_EVENTFD | VFIO_IRQ_INFO_NORESIZE;
++        info->count = vdev->msix ? vdev->msix->entries : 0;
++        break;
++    case VFIO_PCI_INTX_IRQ_INDEX:
++        info->flags = VFIO_IRQ_INFO_EVENTFD;
++        info->count = 1;
++        break;
++    case VFIO_PCI_ERR_IRQ_INDEX:
++    case VFIO_PCI_REQ_IRQ_INDEX:
++        /*
++         * Apple dext passthrough has no kernel-side AER or device-request
++         * notification currently; return count 0 to tell the core to skip
++         * these.
++         */
++        info->flags = 0;
++        info->count = 0;
++        break;
++    default:
++        return -EINVAL;
++    }
++
++    return 0;
++}
++
++static void apple_vfio_update_irq_mask(VFIODevice *vbasedev)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    uint64_t mask[4] = {0};
++    uint32_t i;
++
++    if (conn == IO_OBJECT_NULL) {
++        return;
++    }
++
++    switch (vdev->interrupt) {
++    case VFIO_INT_MSI:
++    case VFIO_INT_MSIX:
++        for (i = 0; i < vdev->nr_vectors; i++) {
++            if (vdev->msi_vectors[i].use) {
++                mask[i / 64] |= 1ULL << (i % 64);
++            }
++        }
++        break;
++    case VFIO_INT_INTx:
++        mask[0] = 1;
++        break;
++    default:
++        break;
++    }
++
++    apple_dext_set_irq_mask(conn, mask);
++}
++
++static int apple_vfio_set_irqs(VFIODevice *vbasedev, struct vfio_irq_set *irq)
++{
++    apple_vfio_update_irq_mask(vbasedev);
++
++    return 0;
++}
++
++static int apple_vfio_bar_read(VFIODevice *vbasedev, uint8_t nr, off_t off,
++                               uint32_t size, void *data)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    AppleVFIOBarMap *bm = &adev->apple->bar_maps[nr];
++    const void *p;
++    uint64_t value;
++
++    if (!bm->addr || off + size > bm->size) {
++        error_report("vfio-apple: BAR%d read out of range or unmapped", nr);
++        return -EINVAL;
++    }
++
++    if (size != 1 && size != 2 && size != 4 && size != 8) {
++        return -EINVAL;
++    }
++
++    p = (const char *)bm->addr + off;
++    value = host_pci_ldn_le_p(p, size);
++    memcpy(data, &value, size);
++
++    return size;
++}
++
++static int apple_vfio_region_read(VFIODevice *vbasedev, uint8_t nr, off_t off,
++                                  uint32_t size, void *data)
++{
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    kern_return_t kr;
++    uint32_t legacy_size = 0;
++
++    if (nr != VFIO_PCI_CONFIG_REGION_INDEX) {
++        return apple_vfio_bar_read(vbasedev, nr, off, size, data);
++    }
++
++    if (conn == IO_OBJECT_NULL) {
++        return -ENODEV;
++    }
++
++    legacy_size = MIN(size, PCIE_CONFIG_SPACE_SIZE - off);
++
++    if (legacy_size == 1 || legacy_size == 2 || legacy_size == 4) {
++        uint64_t value = 0;
++
++        kr = apple_dext_config_read(conn, off, legacy_size, &value);
++        if (kr != KERN_SUCCESS) {
++            return -EIO;
++        }
++
++        memcpy(data, &value, legacy_size);
++        if (legacy_size < size) {
++            memset((uint8_t *)data + legacy_size, 0, size - legacy_size);
++        }
++        return size;
++    }
++
++    kr = apple_dext_config_read_block(conn, off, data, legacy_size);
++    if (kr != KERN_SUCCESS) {
++        return -EIO;
++    }
++    if (legacy_size < size) {
++        memset((uint8_t *)data + legacy_size, 0, size - legacy_size);
++    }
++    return size;
++}
++
++static bool apple_vfio_config_write_is_safe(VFIOPCIDevice *vdev,
++                                            off_t off, uint32_t size)
++{
++    PCIDevice *pdev = PCI_DEVICE(vdev);
++    off_t end = off + size;
++
++    /*
++     * Block writes that would reprogram the device's bus identity or
++     * address decoders.  macOS / DART owns those registers; touching
++     * them from the guest breaks the IOKit mapping and the device
++     * "falls off the bus."
++     *
++     * Everything else (vendor capabilities, MSI-X control, PCIe cap,
++     * etc.) is forwarded.
++     */
++
++    /* PCI_STATUS stays emulated/blocked */
++    if (off < PCI_STATUS + 2 && end > PCI_STATUS) {
++        return false;
++    }
++
++    /* BAR0-BAR5 */
++    if (off < PCI_BASE_ADDRESS_5 + 4 && end > PCI_BASE_ADDRESS_0) {
++        return false;
++    }
++
++    /*
++     * MSI capability — the dext programmed the real device's MSI
++     * Message Address/Data via ConfigureInterrupts() so the hardware
++     * delivers to an IOInterruptDispatchSource.  The guest's writes
++     * to this cap target its own virtual MSI controller; forwarding
++     * them overwrites the dext's routing and the device stops
++     * delivering MSIs entirely.  QEMU's PCI core keeps the emulated
++     * view so the guest sees what it wrote.
++     */
++    if (pdev->cap_present & QEMU_PCI_CAP_MSI && pdev->msi_cap != 0 &&
++        ranges_overlap(off, size, pdev->msi_cap,
++                       vdev->msi_cap_size ? vdev->msi_cap_size : 0x18)) {
++        return false;
++    }
++
++    /*
++     * PCIe Device Control / Device Control 2 — writing MPS or MRRS to
++     * the physical device while DART mappings are active causes PCIe
++     * completion timeouts.
++     */
++    if (pdev->cap_present & QEMU_PCI_CAP_EXPRESS) {
++        uint8_t pcie_cap = pdev->exp.exp_cap;
++        if (ranges_overlap(off, size, pcie_cap + PCI_EXP_DEVCTL, 2) ||
++            ranges_overlap(off, size, pcie_cap + PCI_EXP_DEVCTL2, 2)) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++static int apple_vfio_forward_command_write(io_connect_t conn, off_t off,
++                                            uint32_t size, const void *data)
++{
++    const uint8_t *bytes = data;
++    off_t end = off + size;
++    off_t cmd_start = MAX(off, (off_t)PCI_COMMAND);
++    off_t cmd_end = MIN(end, (off_t)(PCI_COMMAND + 2));
++    off_t pos;
++
++    if (conn == IO_OBJECT_NULL) {
++        return -ENODEV;
++    }
++
++    for (pos = cmd_start; pos < cmd_end; pos++) {
++        uint64_t value = bytes[pos - off];
++        kern_return_t kr = apple_dext_config_write(conn, pos, 1, value);
++
++        if (kr != KERN_SUCCESS) {
++            return -EIO;
++        }
++    }
++
++    return 0;
++}
++
++static int apple_vfio_bar_write(VFIODevice *vbasedev, uint8_t nr, off_t off,
++                                uint32_t size, void *data)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    AppleVFIOBarMap *bm = &adev->apple->bar_maps[nr];
++    void *p;
++    uint64_t value = 0;
++
++    if (!bm->addr || off + size > bm->size) {
++        error_report("vfio-apple: BAR%d write out of range or unmapped", nr);
++        return -EINVAL;
++    }
++
++    if (size != 1 && size != 2 && size != 4 && size != 8) {
++        return -EINVAL;
++    }
++
++    memcpy(&value, data, size);
++
++    p = (char *)bm->addr + off;
++    host_pci_stn_le_p(p, size, value);
++
++    return size;
++}
++
++static int apple_vfio_region_write(VFIODevice *vbasedev, uint8_t nr, off_t off,
++                                   uint32_t size, void *data, bool post)
++{
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    uint64_t value = 0;
++    kern_return_t kr;
++    uint32_t legacy_size;
++
++    if (nr != VFIO_PCI_CONFIG_REGION_INDEX) {
++        return apple_vfio_bar_write(vbasedev, nr, off, size, data);
++    }
++
++    if (off < PCI_COMMAND + 2 && off + size > PCI_COMMAND) {
++        int ret = apple_vfio_forward_command_write(conn, off, size, data);
++
++        if (ret) {
++            return ret;
++        }
++
++        if (off >= PCI_COMMAND && off + size <= PCI_COMMAND + 2) {
++            return size;
++        }
++    }
++
++    if (!apple_vfio_config_write_is_safe(VFIO_PCI_DEVICE(vbasedev->dev),
++                                        off, size)) {
++        return size;
++    }
++
++    if (conn == IO_OBJECT_NULL) {
++        return -ENODEV;
++    }
++
++    memcpy(&value, data, size);
++    legacy_size = MIN(size, PCIE_CONFIG_SPACE_SIZE - off);
++    if (!(legacy_size == 1 || legacy_size == 2 || legacy_size == 4)) {
++        return -EINVAL;
++    }
++
++    kr = apple_dext_config_write(conn, off, legacy_size, value);
++    if (kr != KERN_SUCCESS) {
++        return -EIO;
++    }
++    return size;
++}
++
++static int apple_vfio_region_map(VFIODevice *vbasedev, VFIORegion *region);
++static void apple_vfio_region_unmap(VFIODevice *vbasedev, VFIORegion *region);
++
++static int apple_vfio_region_map(VFIODevice *vbasedev, VFIORegion *region)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    int bar = region->nr;
++    VFIOBAR *vbar;
++    mach_vm_address_t local_addr = 0;
++    mach_vm_size_t bar_size = 0;
++    uint8_t bar_type = 0;
++    kern_return_t kr;
++    int i;
++
++    if (bar < VFIO_PCI_BAR0_REGION_INDEX || bar >= VFIO_PCI_ROM_REGION_INDEX) {
++        return 0;
++    }
++
++    vbar = &vdev->bars[bar];
++
++    if (conn == IO_OBJECT_NULL || !vbar->size || vbar->ioport) {
++        return 0;
++    }
++
++    if (bar > 0 && vdev->bars[bar - 1].mem64) {
++        return 0;
++    }
++
++    if (adev->apple->bar_maps[bar].addr != NULL) {
++        return 0;
++    }
++
++    kr = apple_dext_map_bar(conn, bar, &local_addr, &bar_size, &bar_type);
++    if (kr != KERN_SUCCESS) {
++        warn_report("vfio-apple: BAR%d map failed for %s: 0x%x",
++                    bar, vbasedev->name, kr);
++        return -EIO;
++    }
++
++    if (bar_size > vbar->size) {
++        bar_size = vbar->size;
++    }
++
++    adev->apple->bar_maps[bar].addr = (void *)local_addr;
++    adev->apple->bar_maps[bar].size = bar_size;
++
++    /*
++     * Use the pre-computed mmap regions — already split around the MSI-X
++     * table/PBA hole by vfio_pci_fixup_msix_region() during realize.
++     * We just need to fill in the host pointers from our dext mapping.
++     */
++    for (i = 0; i < region->nr_mmaps; i++) {
++        region->mmaps[i].mmap = (char *)local_addr + region->mmaps[i].offset;
++        vfio_region_register_mmap(region, i);
++    }
++
++    return 0;
++}
++
++static void apple_vfio_region_unmap(VFIODevice *vbasedev, VFIORegion *region)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    int bar = region->nr;
++    AppleVFIOBarMap *bm;
++    int i;
++
++    if (bar < VFIO_PCI_BAR0_REGION_INDEX || bar >= VFIO_PCI_ROM_REGION_INDEX) {
++        return;
++    }
++
++    bm = &adev->apple->bar_maps[bar];
++
++    for (i = 0; i < region->nr_mmaps; i++) {
++        if (region->mmaps[i].mmap) {
++            vfio_region_unregister_mmap(region, i);
++            region->mmaps[i].mmap = NULL;
++        }
++    }
++
++    if (conn != IO_OBJECT_NULL && bm->addr != NULL) {
++        apple_dext_unmap_bar(conn, bar, (mach_vm_address_t)bm->addr);
++    }
++
++    bm->addr = NULL;
++    bm->size = 0;
++}
++
++VFIODeviceIOOps apple_vfio_device_io_ops = {
++    .device_feature = apple_vfio_device_feature,
++    .get_region_info = apple_vfio_get_region_info,
++    .get_irq_info = apple_vfio_get_irq_info,
++    .set_irqs = apple_vfio_set_irqs,
++    .device_reset = apple_vfio_device_reset,
++    .region_read = apple_vfio_region_read,
++    .region_write = apple_vfio_region_write,
++    .region_map = apple_vfio_region_map,
++    .region_unmap = apple_vfio_region_unmap,
++};
++
++bool apple_vfio_dext_publish(uint8_t bus, uint8_t device, uint8_t function,
++                             const char *host_root, io_connect_t conn)
++{
++    AppleVFIOSharedDext *shared;
++    gchar *key = apple_vfio_dext_key(bus, device, function, host_root);
++
++    if (!apple_vfio_shared_dexts) {
++        apple_vfio_shared_dexts =
++            g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
++    }
++
++    if (g_hash_table_lookup(apple_vfio_shared_dexts, key)) {
++        g_free(key);
++        return false;
++    }
++
++    shared = g_new0(AppleVFIOSharedDext, 1);
++    shared->conn = conn;
++    shared->refs = 1;
++    g_hash_table_insert(apple_vfio_shared_dexts, key, shared);
++    return true;
++}
++
++io_connect_t apple_vfio_dext_lookup(uint8_t bus, uint8_t device,
++                                    uint8_t function,
++                                    const char *host_root)
++{
++    AppleVFIOSharedDext *shared;
++    gchar *key;
++
++    if (!apple_vfio_shared_dexts) {
++        return IO_OBJECT_NULL;
++    }
++
++    key = apple_vfio_dext_key(bus, device, function, host_root);
++    shared = g_hash_table_lookup(apple_vfio_shared_dexts, key);
++    g_free(key);
++    if (!shared) {
++        return IO_OBJECT_NULL;
++    }
++
++    shared->refs++;
++    return shared->conn;
++}
++
++void apple_vfio_dext_release(uint8_t bus, uint8_t device, uint8_t function,
++                             const char *host_root, io_connect_t conn)
++{
++    AppleVFIOSharedDext *shared;
++    gchar *key;
++
++    if (!apple_vfio_shared_dexts) {
++        return;
++    }
++
++    key = apple_vfio_dext_key(bus, device, function, host_root);
++    shared = g_hash_table_lookup(apple_vfio_shared_dexts, key);
++    if (!shared || shared->conn != conn) {
++        g_free(key);
++        return;
++    }
++
++    if (--shared->refs == 0) {
++        apple_dext_disconnect(conn);
++        g_hash_table_remove(apple_vfio_shared_dexts, key);
++    }
++    g_free(key);
++}
++
++/* ------------------------------------------------------------------ */
++/* DMA bounce buffer                                                  */
++/* ------------------------------------------------------------------ */
++
++static VFIOAppleBounceList apple_vfio_bounce_list =
++    QLIST_HEAD_INITIALIZER(apple_vfio_bounce_list);
++
++VFIOAppleBounceList *apple_vfio_get_bounce_buffers(void)
++{
++    return &apple_vfio_bounce_list;
++}
++
++static bool apple_vfio_setup_bounce_buffer(VFIOApplePCIDevice *adev,
++                                           Error **errp)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    VFIODevice *vbasedev = &vdev->vbasedev;
++    PCIDevice *pdev = PCI_DEVICE(vdev);
++    io_connect_t conn = apple_vfio_connection(vbasedev);
++    uint64_t size = adev->dma_bounce_size;
++    uint64_t bus_addr = 0, bus_len = 0;
++    mach_vm_address_t map_addr = 0;
++    mach_vm_size_t map_size = 0;
++    VFIOAppleBounceBuffer *bb;
++    kern_return_t kr;
++
++    if (size == 0) {
++        return true;
++    }
++
++    if (conn == IO_OBJECT_NULL) {
++        error_setg(errp, "vfio-apple: no dext connection for bounce buffer");
++        return false;
++    }
++
++    /*
++     * Ask the dext to allocate a DMA buffer and call PrepareForDMA as a
++     * single operation.  This yields a contiguous IOVA because the DART
++     * sees one IOBufferMemoryDescriptor rather than many small client
++     * memory descriptors with guard-page gaps between them.
++     *
++     * The buffer is mapped into our address space via IOConnectMapMemory64
++     * so we can back a guest MemoryRegion with it.
++     */
++    kr = apple_dext_allocate_dma_buffer(conn, size, 0,
++                                        &bus_addr, &bus_len,
++                                        &map_addr, &map_size);
++    if (kr != KERN_SUCCESS) {
++        error_setg(errp, "vfio-apple: AllocateDMABuffer failed "
++                   "(size=%" PRIu64 " kr=0x%x)", size, kr);
++        return false;
++    }
++
++    if (bus_len < size) {
++        error_setg(errp, "vfio-apple: DMA buffer segment too short "
++                   "(%" PRIu64 " < %" PRIu64 "); IOVA may not be contiguous",
++                   bus_len, size);
++        apple_dext_free_dma_buffer(conn, map_addr);
++        return false;
++    }
++
++    /* Verify the IOVA range does not collide with existing guest memory */
++    MemoryRegionSection mrs = memory_region_find(get_system_memory(),
++                                                 bus_addr, size);
++    if (mrs.mr) {
++        error_setg(errp, "vfio-apple: bounce buffer IOVA range "
++                   "[0x%" PRIx64 ", 0x%" PRIx64 ") overlaps with "
++                   "existing memory region '%s'",
++                   bus_addr, bus_addr + size,
++                   memory_region_name(mrs.mr));
++        memory_region_unref(mrs.mr);
++        apple_dext_free_dma_buffer(conn, map_addr);
++        return false;
++    }
++
++    /* Build the bounce buffer descriptor */
++    bb = g_new0(VFIOAppleBounceBuffer, 1);
++    bb->host_addr = (void *)(uintptr_t)map_addr;
++    bb->iova = bus_addr;
++    bb->size = size;
++    bb->pci_bus = pci_dev_bus_num(pdev);
++    bb->pci_slot = PCI_SLOT(pdev->devfn);
++    bb->pci_func = PCI_FUNC(pdev->devfn);
++
++    /* Create a RAM MemoryRegion backed by the shared dext buffer */
++    memory_region_init_ram_ptr(&bb->mr, OBJECT(adev), "vfio-apple-bounce",
++                               size, bb->host_addr);
++
++    /* Identity-map: place the bounce buffer at its IOVA in guest PA space */
++    memory_region_add_subregion(get_system_memory(), bb->iova, &bb->mr);
++    bb->mapped = true;
++
++    adev->bounce = bb;
++    QLIST_INSERT_HEAD(&apple_vfio_bounce_list, bb, next);
++
++    info_report("vfio-apple: bounce buffer %" PRIu64 " MiB at IOVA "
++                "0x%" PRIx64 " for PCI %02x:%02x.%x",
++                size / (1024 * 1024), bus_addr,
++                bb->pci_bus, bb->pci_slot, bb->pci_func);
++
++    return true;
++}
++
++static void apple_vfio_teardown_bounce_buffer(VFIOApplePCIDevice *adev)
++{
++    VFIOAppleBounceBuffer *bb = adev->bounce;
++    io_connect_t conn;
++
++    if (bb == NULL) {
++        return;
++    }
++
++    conn = apple_vfio_connection(&VFIO_PCI_DEVICE(adev)->vbasedev);
++
++    QLIST_REMOVE(bb, next);
++
++    if (bb->mapped) {
++        memory_region_del_subregion(get_system_memory(), &bb->mr);
++        bb->mapped = false;
++    }
++
++    object_unparent(OBJECT(&bb->mr));
++    apple_dext_free_dma_buffer(conn,
++                              (mach_vm_address_t)(uintptr_t)bb->host_addr);
++    g_free(bb);
++    adev->bounce = NULL;
++}
++
++/* ------------------------------------------------------------------ */
++/* QOM type: vfio-apple-pci                                           */
++/* ------------------------------------------------------------------ */
++
++static void (*parent_realize)(PCIDevice *, Error **);
++static void (*parent_exit)(PCIDevice *);
++
++static void apple_vfio_pci_instance_init(Object *obj)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(obj);
++
++    apple_vfio_pci_init(adev);
++}
++
++static void apple_vfio_pci_realize_fn(PCIDevice *pdev, Error **errp)
++{
++    ERRP_GUARD();
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(pdev);
++
++    if (!apple_vfio_pci_pre_realize(adev, errp)) {
++        return;
++    }
++
++    parent_realize(pdev, errp);
++    if (*errp) {
++        g_clear_pointer(&adev->apple, g_free);
++        return;
++    }
++
++    if (adev->use_dma_companion) {
++        if (!apple_vfio_create_dma_companion(adev, errp)) {
++            if (parent_exit) {
++                parent_exit(pdev);
++            }
++            g_clear_pointer(&adev->apple, g_free);
++            return;
++        }
++    } else if (adev->dma_bounce_size > 0) {
++        if (!apple_vfio_setup_bounce_buffer(adev, errp)) {
++            if (parent_exit) {
++                parent_exit(pdev);
++            }
++            g_clear_pointer(&adev->apple, g_free);
++            return;
++        }
++    }
++}
++
++static void apple_vfio_pci_exit_fn(PCIDevice *pdev)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(pdev);
++
++    apple_vfio_teardown_bounce_buffer(adev);
++    apple_vfio_destroy_dma_companion(adev);
++
++    if (parent_exit) {
++        parent_exit(pdev);
++    }
++}
++
++static void apple_vfio_pci_finalize_fn(Object *obj)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(obj);
++
++    apple_vfio_device_cleanup(adev);
++    g_clear_pointer(&adev->apple, g_free);
++}
++
++static const Property apple_vfio_pci_properties[] = {
++    DEFINE_PROP_BOOL("dma-companion", VFIOApplePCIDevice,
++                     use_dma_companion, false),
++    DEFINE_PROP_SIZE("dma-bounce-size", VFIOApplePCIDevice,
++                     dma_bounce_size, 64 * MiB),
++    /*
++     * `host-root=` disambiguates which VFIOUserPCIDriver instance to
++     * bind to when the BDF given via `host=` is claimed by more than
++     * one dext (different host PCI roots, same BB:DD.F). The value is
++     * the registry-entry name of the topmost IOPCIDevice ancestor —
++     * see `qemu-vfio-apple list-devices` for the ROOT column. Optional; only
++     * required when QEMU otherwise can't pick a unique candidate.
++     */
++    DEFINE_PROP_STRING("host-root", VFIOApplePCIDevice, host_root),
++};
++
++static void apple_vfio_pci_class_init(ObjectClass *klass, const void *data)
++{
++    PCIDeviceClass *pdc = PCI_DEVICE_CLASS(klass);
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    parent_realize = pdc->realize;
++    parent_exit = pdc->exit;
++
++    pdc->realize = apple_vfio_pci_realize_fn;
++    pdc->exit = apple_vfio_pci_exit_fn;
++    device_class_set_props(dc, apple_vfio_pci_properties);
++    dc->user_creatable = true;
++    dc->desc = "VFIO-based PCI device assignment (Apple/macOS)";
++}
++
++static const TypeInfo vfio_apple_pci_info = {
++    .name = TYPE_VFIO_APPLE_PCI,
++    .parent = TYPE_VFIO_PCI,
++    .instance_size = sizeof(VFIOApplePCIDevice),
++    .instance_init = apple_vfio_pci_instance_init,
++    .instance_finalize = apple_vfio_pci_finalize_fn,
++    .class_init = apple_vfio_pci_class_init,
++};
++
++static void register_vfio_apple_pci_type(void)
++{
++    type_register_static(&vfio_apple_pci_info);
++}
++
++type_init(register_vfio_apple_pci_type)
+diff --git a/hw/vfio/apple-dext-client.c b/hw/vfio/apple-dext-client.c
+new file mode 100644
+index 0000000000..0a99d880d4
+--- /dev/null
++++ b/hw/vfio/apple-dext-client.c
+@@ -0,0 +1,956 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * C client implementation for communicating with the VFIOUserPCIDriver dext
++ * via IOKit IOUserClient.
++ *
++ * Copyright (c) 2026 Scott J. Goldman
++ */
++
++#include "qemu/osdep.h"
++
++#include "apple-dext-client.h"
++
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOKit/IOKitLib.h>
++#include <dispatch/dispatch.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++enum {
++    kSelectorGetIdentity        = 0,
++    kSelectorClaim              = 1,
++    kSelectorTerminate          = 2,
++    kSelectorAllocateDMABuffer  = 3,
++    kSelectorFreeDMABuffer      = 4,
++    kSelectorRegisterDMARegion  = 5,
++    kSelectorUnregisterDMARegion = 6,
++    kSelectorProbeDMARegion     = 7,
++    kSelectorConfigRead         = 8,
++    kSelectorConfigWrite        = 9,
++    kSelectorGetBARInfo         = 10,
++    kSelectorMMIORead           = 11,
++    kSelectorMMIOWrite          = 12,
++    kSelectorSetupInterrupts    = 13,
++    kSelectorCheckInterrupt     = 14,
++    kSelectorWaitInterrupt      = 15,
++    kSelectorSetIRQMask         = 16,
++    kSelectorResetDevice        = 17,
++};
++
++/*
++ * Keep this in sync with PCIDriverKit BAR type encoding. Bit 3 indicates
++ * prefetchability for memory BARs.
++ */
++#define APPLE_DEXT_BAR_PREFETCHABLE_MASK 0x08
++#ifndef kIOMapWriteCombineCache
++#define kIOMapWriteCombineCache 0x00000400
++#endif
++
++static bool
++dext_service_matches_class(io_service_t service, const char *className)
++{
++    bool match = false;
++    CFTypeRef ref;
++
++    ref = IORegistryEntryCreateCFProperty(service, CFSTR("IOUserClass"),
++                                          kCFAllocatorDefault, 0);
++    if (ref == NULL) {
++        return false;
++    }
++
++    if (CFGetTypeID(ref) == CFStringGetTypeID()) {
++        CFStringRef expected = CFStringCreateWithCString(
++            kCFAllocatorDefault, className, kCFStringEncodingUTF8);
++        if (expected != NULL) {
++            match = CFStringCompare((CFStringRef)ref, expected, 0)
++                    == kCFCompareEqualTo;
++            CFRelease(expected);
++        }
++    }
++    CFRelease(ref);
++    return match;
++}
++
++static bool
++dext_connection_matches_bdf(io_connect_t connection,
++                            uint8_t bus, uint8_t device, uint8_t function)
++{
++    uint64_t output[6] = {0};
++    uint32_t outputCount = 6;
++    kern_return_t kr;
++
++    kr = IOConnectCallMethod(connection, kSelectorGetIdentity,
++                             NULL, 0, NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS || outputCount < 3) {
++        return false;
++    }
++
++    return (uint8_t)output[0] == bus &&
++           (uint8_t)output[1] == device &&
++           (uint8_t)output[2] == function;
++}
++
++/*
++ * Walk up the IOService plane from `start` to the topmost IOPCIDevice
++ * ancestor (the host PCI root) and copy its registry-entry name into
++ * `out` (NUL-terminated, truncated to `out_size`).  Returns true on
++ * success, false if no IOPCIDevice ancestor exists or `out` would be
++ * empty.
++ *
++ * Each VFIOUserPCIDriver IOUserService entry sits as a child of the
++ * IOPCIDevice it matched against, which itself hangs off intermediate
++ * bridges and finally a root-port IOPCIDevice (e.g. "pci-bridge0",
++ * "pcic0-bridge").  That root-port name is what users see in System
++ * Information and is the disambiguator we expose as `host-root=`.
++ */
++static bool
++dext_root_name(io_service_t start, char *out, size_t out_size)
++{
++    io_registry_entry_t topmost = IO_OBJECT_NULL;
++    io_registry_entry_t current;
++    io_name_t className;
++    kern_return_t kr;
++
++    if (out == NULL || out_size == 0) {
++        return false;
++    }
++    out[0] = '\0';
++
++    current = start;
++    IOObjectRetain(current);
++
++    for (;;) {
++        io_registry_entry_t parent = IO_OBJECT_NULL;
++
++        if (IOObjectGetClass(current, className) == KERN_SUCCESS &&
++            strcmp(className, "IOPCIDevice") == 0) {
++            if (topmost != IO_OBJECT_NULL) {
++                IOObjectRelease(topmost);
++            }
++            IOObjectRetain(current);
++            topmost = current;
++        }
++
++        kr = IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent);
++        IOObjectRelease(current);
++        if (kr != KERN_SUCCESS || parent == IO_OBJECT_NULL) {
++            break;
++        }
++        current = parent;
++    }
++
++    if (topmost == IO_OBJECT_NULL) {
++        return false;
++    }
++
++    io_name_t entryName;
++    kr = IORegistryEntryGetName(topmost, entryName);
++    IOObjectRelease(topmost);
++    if (kr != KERN_SUCCESS || entryName[0] == '\0') {
++        return false;
++    }
++
++    strncpy(out, entryName, out_size - 1);
++    out[out_size - 1] = '\0';
++    return true;
++}
++
++/*
++ * One candidate VFIOUserPCIDriver instance whose BDF matches the lookup.
++ * We keep the IOUserService entry around (rather than the open connection)
++ * so we can re-walk parents and only open the one we actually pick.
++ */
++typedef struct DextCandidate {
++    io_service_t service;       /* retained */
++    char         root[128];
++} DextCandidate;
++
++#define APPLE_DEXT_MAX_CANDIDATES 16
++
++io_connect_t
++apple_dext_connect_with_root(uint8_t bus, uint8_t device, uint8_t function,
++                             const char *host_root, char **errp)
++{
++    CFMutableDictionaryRef matching;
++    io_iterator_t iterator = IO_OBJECT_NULL;
++    io_connect_t result = IO_OBJECT_NULL;
++    io_service_t service;
++    kern_return_t kr;
++    DextCandidate cands[APPLE_DEXT_MAX_CANDIDATES];
++    size_t cand_count = 0;
++    int chosen = -1;
++
++    matching = IOServiceMatching("IOUserService");
++    if (matching == NULL) {
++        return IO_OBJECT_NULL;
++    }
++
++    kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator);
++    if (kr != KERN_SUCCESS) {
++        return IO_OBJECT_NULL;
++    }
++
++    while ((service = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
++        io_connect_t connection = IO_OBJECT_NULL;
++
++        if (!dext_service_matches_class(service, "VFIOUserPCIDriver")) {
++            IOObjectRelease(service);
++            continue;
++        }
++
++        kr = IOServiceOpen(service, mach_task_self(), 0, &connection);
++        if (kr != KERN_SUCCESS) {
++            IOObjectRelease(service);
++            continue;
++        }
++
++        bool bdf_match = dext_connection_matches_bdf(connection, bus, device,
++                                                     function);
++        IOServiceClose(connection);
++
++        if (!bdf_match) {
++            IOObjectRelease(service);
++            continue;
++        }
++
++        if (cand_count >= APPLE_DEXT_MAX_CANDIDATES) {
++            IOObjectRelease(service);
++            continue;
++        }
++
++        DextCandidate *c = &cands[cand_count++];
++        c->service = service; /* keep retained */
++        if (!dext_root_name(service, c->root, sizeof(c->root))) {
++            strncpy(c->root, "?", sizeof(c->root) - 1);
++            c->root[sizeof(c->root) - 1] = '\0';
++        }
++    }
++
++    IOObjectRelease(iterator);
++
++    if (cand_count == 0) {
++        if (errp != NULL && *errp == NULL) {
++        *errp = strdup("no VFIOUserPCIDriver dext instance is bound to "
++                       "that BDF — run `qemu-vfio-apple list-devices` to "
++                       "see which devices the dext currently claims");
++        }
++        return IO_OBJECT_NULL;
++    }
++
++    if (host_root == NULL || host_root[0] == '\0') {
++        if (cand_count == 1) {
++            chosen = 0;
++        } else if (errp != NULL) {
++            /* Build "pcic0-bridge, pcic1-bridge" candidate list. */
++            size_t list_cap = 0;
++            for (size_t i = 0; i < cand_count; i++) {
++                list_cap += strlen(cands[i].root) + 2; /* ", " */
++            }
++            char *list = (char *)calloc(list_cap + 1, 1);
++            if (list != NULL) {
++                for (size_t i = 0; i < cand_count; i++) {
++                    if (i > 0) {
++                        strcat(list, ", ");
++                    }
++                    strcat(list, cands[i].root);
++                }
++            }
++            const char *fmt =
++                "%02x:%02x.%x is claimed by %zu VFIOUserPCIDriver instances "
++                "(%s); add host-root=<name> to disambiguate";
++            int len = snprintf(NULL, 0, fmt,
++                               bus, device, function,
++                               cand_count, list ? list : "?");
++            if (len > 0) {
++                char *msg = (char *)malloc((size_t)len + 1);
++                if (msg != NULL) {
++                    snprintf(msg, (size_t)len + 1, fmt,
++                             bus, device, function,
++                             cand_count, list ? list : "?");
++                    *errp = msg;
++                }
++            }
++            free(list);
++        }
++    } else {
++        for (size_t i = 0; i < cand_count; i++) {
++            if (strcmp(cands[i].root, host_root) == 0) {
++                chosen = (int)i;
++                break;
++            }
++        }
++        if (chosen < 0 && errp != NULL) {
++            const char *fmt =
++                "no VFIOUserPCIDriver instance for %02x:%02x.%x under root "
++                "'%s' (found under: %s)";
++            size_t list_cap = 0;
++            for (size_t i = 0; i < cand_count; i++) {
++                list_cap += strlen(cands[i].root) + 2;
++            }
++            char *list = (char *)calloc(list_cap + 1, 1);
++            if (list != NULL) {
++                for (size_t i = 0; i < cand_count; i++) {
++                    if (i > 0) {
++                        strcat(list, ", ");
++                    }
++                    strcat(list, cands[i].root);
++                }
++            }
++            int len = snprintf(NULL, 0, fmt,
++                               bus, device, function,
++                               host_root, list ? list : "?");
++            if (len > 0) {
++                char *msg = (char *)malloc((size_t)len + 1);
++                if (msg != NULL) {
++                    snprintf(msg, (size_t)len + 1, fmt,
++                             bus, device, function,
++                             host_root, list ? list : "?");
++                    *errp = msg;
++                }
++            }
++            free(list);
++        }
++    }
++
++    if (chosen >= 0) {
++        kr = IOServiceOpen(cands[chosen].service, mach_task_self(), 0,
++                           &result);
++        if (kr != KERN_SUCCESS) {
++            result = IO_OBJECT_NULL;
++        }
++    }
++
++    for (size_t i = 0; i < cand_count; i++) {
++        IOObjectRelease(cands[i].service);
++    }
++
++    return result;
++}
++
++io_connect_t
++apple_dext_connect(uint8_t bus, uint8_t device, uint8_t function)
++{
++    return apple_dext_connect_with_root(bus, device, function, NULL, NULL);
++}
++
++void
++apple_dext_disconnect(io_connect_t connection)
++{
++    if (connection != IO_OBJECT_NULL) {
++        IOServiceClose(connection);
++    }
++}
++
++kern_return_t
++apple_dext_claim(io_connect_t connection)
++{
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    return IOConnectCallMethod(connection,
++                               kSelectorClaim,
++                               NULL, 0, NULL, 0,
++                               NULL, NULL, NULL, NULL);
++}
++
++kern_return_t
++apple_dext_register_dma(io_connect_t connection,
++                            uint64_t iova,
++                            uint64_t client_va,
++                            uint64_t size,
++                            uint64_t *out_bus_addr,
++                            uint64_t *out_bus_len)
++{
++    uint64_t input[3] = { iova, client_va, size };
++    uint64_t output[3] = {0};
++    uint32_t outputCount = 3;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorRegisterDMARegion,
++                             input, 3,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    if (out_bus_addr != NULL && outputCount >= 2) {
++        *out_bus_addr = output[1];
++    }
++    if (out_bus_len != NULL && outputCount >= 3) {
++        *out_bus_len = output[2];
++    }
++
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_allocate_dma_buffer(io_connect_t connection,
++                               uint64_t size,
++                               uint64_t alignment,
++                               uint64_t *out_bus_addr,
++                               uint64_t *out_bus_len,
++                               mach_vm_address_t *out_addr,
++                               mach_vm_size_t *out_size)
++{
++    uint64_t input[2] = { size, alignment };
++    uint64_t output[6] = {0};
++    uint32_t outputCount = 6;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorAllocateDMABuffer,
++                             input, 2,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    /* output[0] = size, [1] = flags, [2] = segCount, [3] = addr, [4] = len */
++    if (out_bus_addr != NULL && outputCount >= 4) {
++        *out_bus_addr = output[3];
++    }
++    if (out_bus_len != NULL && outputCount >= 5) {
++        *out_bus_len = output[4];
++    }
++
++    /* Map the dext-owned buffer into our address space */
++    if (out_addr != NULL && out_size != NULL) {
++        mach_vm_address_t addr = 0;
++        mach_vm_size_t map_size = 0;
++
++        /* Memory type 0 = kVFIOUserPCIDriverUserClientMemoryTypeDMABuffer */
++        kr = IOConnectMapMemory64(connection, 0, mach_task_self(),
++                                  &addr, &map_size, kIOMapAnywhere);
++        if (kr != KERN_SUCCESS) {
++            return kr;
++        }
++
++        *out_addr = addr;
++        *out_size = map_size;
++    }
++
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_free_dma_buffer(io_connect_t connection,
++                           mach_vm_address_t addr)
++{
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    if (addr != 0) {
++        IOConnectUnmapMemory64(connection, 0, mach_task_self(), addr);
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorFreeDMABuffer,
++                             NULL, 0, NULL, 0,
++                             NULL, NULL, NULL, NULL);
++    return kr;
++}
++
++kern_return_t
++apple_dext_unregister_dma(io_connect_t connection,
++                              uint64_t iova)
++{
++    uint64_t input[1] = { iova };
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    return IOConnectCallMethod(connection,
++                               kSelectorUnregisterDMARegion,
++                               input, 1,
++                               NULL, 0,
++                               NULL, NULL,
++                               NULL, NULL);
++}
++
++kern_return_t
++apple_dext_probe_dma(io_connect_t connection,
++                         uint64_t iova,
++                         uint64_t offset,
++                         uint64_t *out_word)
++{
++    uint64_t input[2] = { iova, offset };
++    uint64_t output[1] = {0};
++    uint32_t outputCount = 1;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL || out_word == NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorProbeDMARegion,
++                             input, 2,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    *out_word = output[0];
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_config_read(io_connect_t connection,
++                           uint64_t offset,
++                           uint64_t width,
++                           uint64_t *out_value)
++{
++    uint64_t input[2] = { offset, width };
++    uint64_t output[1] = {0};
++    uint32_t outputCount = 1;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL || out_value == NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorConfigRead,
++                             input, 2,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    *out_value = output[0];
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_config_write(io_connect_t connection,
++                            uint64_t offset,
++                            uint64_t width,
++                            uint64_t value)
++{
++    uint64_t input[3] = { offset, width, value };
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    return IOConnectCallMethod(connection,
++                               kSelectorConfigWrite,
++                               input, 3,
++                               NULL, 0,
++                               NULL, NULL,
++                               NULL, NULL);
++}
++
++kern_return_t
++apple_dext_config_read_block(io_connect_t connection,
++                                 uint64_t offset,
++                                 void *buf,
++                                 size_t len)
++{
++    uint8_t *dst = (uint8_t *)buf;
++    uint64_t pos = offset;
++    size_t remaining = len;
++
++    if (connection == IO_OBJECT_NULL || buf == NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    while (remaining >= 4) {
++        uint64_t val = 0;
++        uint32_t dword;
++        kern_return_t kr;
++
++        kr = apple_dext_config_read(connection, pos, 4, &val);
++        if (kr != KERN_SUCCESS) {
++            return kr;
++        }
++        dword = (uint32_t)val;
++        memcpy(dst, &dword, 4);
++        dst += 4;
++        pos += 4;
++        remaining -= 4;
++    }
++
++    while (remaining > 0) {
++        uint64_t val = 0;
++        kern_return_t kr;
++
++        kr = apple_dext_config_read(connection, pos, 1, &val);
++        if (kr != KERN_SUCCESS) {
++            return kr;
++        }
++        *dst = (uint8_t)val;
++        dst++;
++        pos++;
++        remaining--;
++    }
++
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_get_bar_info(io_connect_t connection,
++                            uint8_t bar,
++                            uint8_t *out_mem_idx,
++                            uint64_t *out_size,
++                            uint8_t *out_type)
++{
++    uint64_t input[1] = { bar };
++    uint64_t output[3] = {0};
++    uint32_t outputCount = 3;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorGetBARInfo,
++                             input, 1,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    if (out_mem_idx != NULL) {
++        *out_mem_idx = (uint8_t)output[0];
++    }
++    if (out_size != NULL) {
++        *out_size = output[1];
++    }
++    if (out_type != NULL) {
++        *out_type = (uint8_t)output[2];
++    }
++
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_map_bar(io_connect_t connection,
++                       uint8_t bar,
++                       mach_vm_address_t *out_addr,
++                       mach_vm_size_t *out_size,
++                       uint8_t *out_type)
++{
++    uint64_t bar_size = 0;
++    uint8_t bar_type = 0;
++    uint32_t mem_type;
++    mach_vm_address_t addr = 0;
++    mach_vm_size_t size = 0;
++    IOOptionBits opts = kIOMapAnywhere;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL || out_addr == NULL || out_size == NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = apple_dext_get_bar_info(connection, bar, NULL,
++                                     &bar_size, &bar_type);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    /*
++     * The memory type for IOConnectMapMemory64 must match the dext's
++     * CopyClientMemoryForType expectation:
++     * kVFIOUserPCIDriverUserClientMemoryTypeBAR0 (= 1) plus the BAR index.
++     * This is NOT the same as the PCIDriverKit internal memoryIndex returned
++     * by GetBARInfo.
++     */
++    mem_type = 1 + (uint32_t)bar;
++
++    if (bar_type & APPLE_DEXT_BAR_PREFETCHABLE_MASK) {
++        opts |= kIOMapWriteCombineCache;
++    }
++
++    kr = IOConnectMapMemory64(connection, mem_type, mach_task_self(),
++                              &addr, &size, opts);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    *out_addr = addr;
++    *out_size = size;
++    if (out_type != NULL) {
++        *out_type = bar_type;
++    }
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_unmap_bar(io_connect_t connection,
++                         uint8_t bar,
++                         mach_vm_address_t addr)
++{
++    uint32_t mem_type = 1 + (uint32_t)bar;
++
++    if (connection == IO_OBJECT_NULL || addr == 0) {
++        return kIOReturnBadArgument;
++    }
++
++    return IOConnectUnmapMemory64(connection, mem_type, mach_task_self(), addr);
++}
++
++kern_return_t
++apple_dext_mmio_read(io_connect_t connection,
++                         uint8_t mem_idx,
++                         uint64_t offset,
++                         uint64_t width,
++                         uint64_t *out_value)
++{
++    uint64_t input[3] = { mem_idx, offset, width };
++    uint64_t output[1] = {0};
++    uint32_t outputCount = 1;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL || out_value == NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorMMIORead,
++                             input, 3,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    *out_value = output[0];
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_mmio_write(io_connect_t connection,
++                          uint8_t mem_idx,
++                          uint64_t offset,
++                          uint64_t width,
++                          uint64_t value)
++{
++    uint64_t input[4] = { mem_idx, offset, width, value };
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    return IOConnectCallMethod(connection,
++                               kSelectorMMIOWrite,
++                               input, 4,
++                               NULL, 0,
++                               NULL, NULL,
++                               NULL, NULL);
++}
++
++kern_return_t
++apple_dext_setup_interrupts(io_connect_t connection,
++                                uint32_t *out_num_vectors)
++{
++    uint64_t output[1] = {0};
++    uint32_t outputCount = 1;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorSetupInterrupts,
++                             NULL, 0,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    if (out_num_vectors != NULL && outputCount >= 1) {
++        *out_num_vectors = (uint32_t)output[0];
++    }
++
++    return kIOReturnSuccess;
++}
++
++kern_return_t
++apple_dext_reset_device(io_connect_t connection)
++{
++    if (connection == IO_OBJECT_NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    return IOConnectCallMethod(connection,
++                               kSelectorResetDevice,
++                               NULL, 0, NULL, 0,
++                               NULL, NULL, NULL, NULL);
++}
++
++kern_return_t
++apple_dext_set_irq_mask(io_connect_t connection, const uint64_t mask[4])
++{
++    if (connection == IO_OBJECT_NULL || mask == NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    return IOConnectCallMethod(connection,
++                               kSelectorSetIRQMask,
++                               mask, 4,
++                               NULL, 0,
++                               NULL, NULL,
++                               NULL, NULL);
++}
++
++kern_return_t
++apple_dext_read_pending_irqs(io_connect_t connection, uint64_t pending[4])
++{
++    uint64_t output[4] = {0};
++    uint32_t outputCount = 4;
++    kern_return_t kr;
++    uint32_t i;
++
++    if (connection == IO_OBJECT_NULL || pending == NULL) {
++        return kIOReturnBadArgument;
++    }
++
++    kr = IOConnectCallMethod(connection,
++                             kSelectorCheckInterrupt,
++                             NULL, 0,
++                             NULL, 0,
++                             output, &outputCount,
++                             NULL, NULL);
++    if (kr != KERN_SUCCESS) {
++        return kr;
++    }
++
++    for (i = 0; i < 4; i++) {
++        pending[i] = (i < outputCount) ? output[i] : 0;
++    }
++
++    return kIOReturnSuccess;
++}
++
++struct AppleDextInterruptNotify {
++    io_connect_t connection;
++    IONotificationPortRef notifyPort;
++    mach_port_t machPort;
++    dispatch_queue_t dispatchQueue;
++    void (*handler_fn)(void *opaque);
++    void *opaque;
++};
++
++static void
++apple_dext_async_callback(void *refcon, IOReturn result,
++                          void **args, uint32_t numArgs)
++{
++    AppleDextInterruptNotify *notify = refcon;
++
++    if (result == kIOReturnSuccess && notify->handler_fn) {
++        notify->handler_fn(notify->opaque);
++    }
++}
++
++static kern_return_t
++apple_dext_interrupt_notify_arm(AppleDextInterruptNotify *notify)
++{
++    uint64_t asyncRef[kIOAsyncCalloutCount];
++
++    asyncRef[kIOAsyncCalloutFuncIndex] =
++        (uint64_t)(uintptr_t)apple_dext_async_callback;
++    asyncRef[kIOAsyncCalloutRefconIndex] =
++        (uint64_t)(uintptr_t)notify;
++
++    return IOConnectCallAsyncMethod(notify->connection,
++                                    kSelectorWaitInterrupt,
++                                    notify->machPort,
++                                    asyncRef, kIOAsyncCalloutCount,
++                                    NULL, 0, NULL, 0,
++                                    NULL, NULL, NULL, NULL);
++}
++
++AppleDextInterruptNotify *
++apple_dext_interrupt_notify_create(io_connect_t connection,
++                                   void (*handler_fn)(void *opaque),
++                                   void *opaque)
++{
++    AppleDextInterruptNotify *notify;
++    kern_return_t kr;
++
++    if (connection == IO_OBJECT_NULL || handler_fn == NULL) {
++        return NULL;
++    }
++
++    notify = g_new0(AppleDextInterruptNotify, 1);
++    notify->connection = connection;
++    notify->handler_fn = handler_fn;
++    notify->opaque = opaque;
++
++    notify->notifyPort = IONotificationPortCreate(kIOMainPortDefault);
++    if (!notify->notifyPort) {
++        g_free(notify);
++        return NULL;
++    }
++
++    notify->dispatchQueue = dispatch_queue_create(
++        "org.qemu.vfio-apple.irq-notify", DISPATCH_QUEUE_SERIAL);
++    IONotificationPortSetDispatchQueue(notify->notifyPort,
++                                       notify->dispatchQueue);
++    notify->machPort = IONotificationPortGetMachPort(notify->notifyPort);
++
++    kr = apple_dext_interrupt_notify_arm(notify);
++    if (kr != KERN_SUCCESS) {
++        IONotificationPortDestroy(notify->notifyPort);
++        dispatch_release(notify->dispatchQueue);
++        g_free(notify);
++        return NULL;
++    }
++
++    return notify;
++}
++
++kern_return_t
++apple_dext_interrupt_notify_rearm(AppleDextInterruptNotify *notify)
++{
++    if (!notify) {
++        return kIOReturnBadArgument;
++    }
++    return apple_dext_interrupt_notify_arm(notify);
++}
++
++void
++apple_dext_interrupt_notify_destroy(AppleDextInterruptNotify *notify)
++{
++    if (!notify) {
++        return;
++    }
++
++    IONotificationPortDestroy(notify->notifyPort);
++    dispatch_release(notify->dispatchQueue);
++    g_free(notify);
++}
+diff --git a/hw/vfio/apple-dext-client.h b/hw/vfio/apple-dext-client.h
+new file mode 100644
+index 0000000000..9975b6050a
+--- /dev/null
++++ b/hw/vfio/apple-dext-client.h
+@@ -0,0 +1,305 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * C API for connecting to the VFIOUserPCIDriver DriverKit extension.
++ *
++ * The vfio-user server process uses this to:
++ *  1. Find and open an IOUserClient to the dext for a given PCI BDF.
++ *  2. Claim the device so the dext opens its IOPCIDevice provider.
++ *  3. Register client-owned memory (QEMU guest RAM mapped via shared file)
++ *     for DMA by the physical PCI device.
++ *  4. Unregister DMA regions when QEMU removes them.
++ *
++ * Integration with libvfio-user:
++ *   vfu_dma_register_cb_t  ->  apple_dext_register_dma()
++ *   vfu_dma_unregister_cb_t -> apple_dext_unregister_dma()
++ *
++ * Copyright (c) 2026 Scott J. Goldman
++ */
++
++#ifndef HW_VFIO_APPLE_DEXT_CLIENT_H
++#define HW_VFIO_APPLE_DEXT_CLIENT_H
++
++#include <IOKit/IOKitLib.h>
++#include <stdint.h>
++
++/*
++ * Find the VFIOUserPCIDriver dext instance matching the given PCI BDF
++ * and open an IOUserClient connection to it.
++ *
++ * If `host_root` is NULL, BDF must uniquely identify a single
++ * VFIOUserPCIDriver instance — if two or more dext instances claim the
++ * same BDF (because they live under different host PCI roots), this
++ * fails with `*errp` describing the candidates. The caller can then
++ * specify `host_root` to pick one (the registry-entry name of the
++ * topmost IOPCIDevice ancestor, e.g. "pcic0-bridge" or "pci-bridge0").
++ *
++ * If `host_root` is non-NULL, only the matching candidate is selected.
++ *
++ * Returns IO_OBJECT_NULL on failure (with `*errp` set on ambiguity or no
++ * match; left unset on plain IOKit errors so callers can synthesise their
++ * own message).
++ */
++io_connect_t apple_dext_connect_with_root(uint8_t bus, uint8_t device,
++                                          uint8_t function,
++                                          const char *host_root,
++                                          char **errp);
++
++/*
++ * Convenience wrapper: same as apple_dext_connect_with_root(..., NULL, NULL).
++ * Use this for paths that have already validated uniqueness or don't care.
++ */
++io_connect_t apple_dext_connect(uint8_t bus, uint8_t device,
++                                    uint8_t function);
++
++/*
++ * Close a previously opened connection.
++ */
++void apple_dext_disconnect(io_connect_t connection);
++
++/*
++ * Claim the PCI device through the dext (opens the IOPCIDevice provider).
++ * Must be called before registering DMA regions.
++ */
++kern_return_t apple_dext_claim(io_connect_t connection);
++
++/*
++ * Register a region of this process's address space for DMA.
++ *
++ * @iova:         guest IOVA (device-visible DMA address)
++ * @client_va:    virtual address of the memory in this process
++ * @size:         region size in bytes
++ * @out_bus_addr: receives first DMA bus address segment (may be NULL)
++ * @out_bus_len:  receives first DMA bus address segment length (may be NULL)
++ *
++ * The memory at client_va must remain valid and mapped until the region
++ * is unregistered.
++ */
++kern_return_t apple_dext_register_dma(io_connect_t connection,
++                                          uint64_t iova,
++                                          uint64_t client_va,
++                                          uint64_t size,
++                                          uint64_t *out_bus_addr,
++                                          uint64_t *out_bus_len);
++
++/*
++ * Allocate a DMA buffer in the dext and map it into this process.
++ *
++ * The dext allocates kernel memory (IOBufferMemoryDescriptor) and calls
++ * PrepareForDMA once for the entire buffer, yielding a contiguous IOVA.
++ * The buffer is then mapped into the caller's address space.
++ *
++ * @size:         requested buffer size in bytes
++ * @alignment:    alignment in bytes (0 defaults to page size)
++ * @out_bus_addr: receives the DMA bus address (IOVA)
++ * @out_bus_len:  receives the DMA segment length
++ * @out_addr:     receives the mapped virtual address in this process
++ * @out_size:     receives the mapped size
++ */
++kern_return_t apple_dext_allocate_dma_buffer(io_connect_t connection,
++                                             uint64_t size,
++                                             uint64_t alignment,
++                                             uint64_t *out_bus_addr,
++                                             uint64_t *out_bus_len,
++                                             mach_vm_address_t *out_addr,
++                                             mach_vm_size_t *out_size);
++
++/*
++ * Free a DMA buffer previously allocated with apple_dext_allocate_dma_buffer.
++ * Unmaps the buffer from this process and releases it in the dext.
++ *
++ * @addr: the mapped address returned by apple_dext_allocate_dma_buffer
++ */
++kern_return_t apple_dext_free_dma_buffer(io_connect_t connection,
++                                         mach_vm_address_t addr);
++
++/*
++ * Unregister a previously registered DMA region identified by its IOVA.
++ */
++kern_return_t apple_dext_unregister_dma(io_connect_t connection,
++                                            uint64_t iova);
++
++/*
++ * Read 8 bytes from a registered DMA region's IOMemoryDescriptor.
++ * Used to verify the descriptor references the same physical pages
++ * as the client's virtual mapping.
++ *
++ * @iova:     base IOVA of the registered region
++ * @offset:   byte offset within the region to read from
++ * @out_word: receives the 8-byte value read from the descriptor
++ */
++kern_return_t apple_dext_probe_dma(io_connect_t connection,
++                                       uint64_t iova,
++                                       uint64_t offset,
++                                       uint64_t *out_word);
++
++/*
++ * Read from PCI configuration space.
++ *
++ * @offset: byte offset into config space
++ * @width:  access width in bytes (1, 2, or 4)
++ * @out_value: receives the value read
++ */
++kern_return_t apple_dext_config_read(io_connect_t connection,
++                                         uint64_t offset,
++                                         uint64_t width,
++                                         uint64_t *out_value);
++
++/*
++ * Write to PCI configuration space.
++ *
++ * @offset: byte offset into config space
++ * @width:  access width in bytes (1, 2, or 4)
++ * @value:  value to write
++ */
++kern_return_t apple_dext_config_write(io_connect_t connection,
++                                          uint64_t offset,
++                                          uint64_t width,
++                                          uint64_t value);
++
++/*
++ * Read a contiguous block of PCI configuration space.
++ * Internally issues repeated 32-bit reads, with a final
++ * narrower read for any trailing bytes.
++ *
++ * @offset: starting byte offset
++ * @buf:    destination buffer
++ * @len:    number of bytes to read
++ */
++kern_return_t apple_dext_config_read_block(io_connect_t connection,
++                                               uint64_t offset,
++                                               void *buf,
++                                               size_t len);
++
++/*
++ * Query BAR information from the PCI device.
++ *
++ * @bar:          BAR index (0-5)
++ * @out_mem_idx:  receives the memory index for MemoryRead/Write calls
++ * @out_size:     receives the BAR size in bytes
++ * @out_type:     receives the BAR type (mem32, mem64, io, etc.)
++ */
++kern_return_t apple_dext_get_bar_info(io_connect_t connection,
++                                          uint8_t bar,
++                                          uint8_t *out_mem_idx,
++                                          uint64_t *out_size,
++                                          uint8_t *out_type);
++
++/*
++ * Map a PCI BAR directly into this process through the dext.
++ *
++ * The dext supplies the BAR's IOMemoryDescriptor and IOKit applies the
++ * appropriate cache mode for the BAR type (default-cache for BAR0 style
++ * register windows, write-combine for prefetchable apertures).
++ *
++ * @bar:      BAR index (0-5)
++ * @out_addr: receives the mapped virtual address
++ * @out_size: receives the mapped size
++ * @out_type: receives the BAR type (may be NULL)
++ */
++kern_return_t apple_dext_map_bar(io_connect_t connection,
++                                     uint8_t bar,
++                                     mach_vm_address_t *out_addr,
++                                     mach_vm_size_t *out_size,
++                                     uint8_t *out_type);
++
++/*
++ * Unmap a BAR previously mapped with apple_dext_map_bar().
++ */
++kern_return_t apple_dext_unmap_bar(io_connect_t connection,
++                                       uint8_t bar,
++                                       mach_vm_address_t addr);
++
++/*
++ * Read from a PCI BAR (MMIO).
++ *
++ * @mem_idx: memory index from apple_dext_get_bar_info
++ * @offset:  byte offset within the BAR
++ * @width:   access width in bytes (1, 2, 4, or 8)
++ * @out_value: receives the value read
++ */
++kern_return_t apple_dext_mmio_read(io_connect_t connection,
++                                       uint8_t mem_idx,
++                                       uint64_t offset,
++                                       uint64_t width,
++                                       uint64_t *out_value);
++
++/*
++ * Write to a PCI BAR (MMIO).
++ *
++ * @mem_idx: memory index from apple_dext_get_bar_info
++ * @offset:  byte offset within the BAR
++ * @width:   access width in bytes (1, 2, 4, or 8)
++ * @value:   value to write
++ */
++kern_return_t apple_dext_mmio_write(io_connect_t connection,
++                                        uint8_t mem_idx,
++                                        uint64_t offset,
++                                        uint64_t width,
++                                        uint64_t value);
++
++/*
++ * Set up interrupt forwarding for the PCI device.
++ * Creates IOInterruptDispatchSource handlers for all available
++ * MSI/MSI-X vectors in the dext. Interrupts are queued in a ring
++ * buffer and retrieved via apple_dext_check_interrupt().
++ *
++ * @out_num_vectors: receives the number of interrupt vectors registered
++ */
++kern_return_t apple_dext_setup_interrupts(io_connect_t connection,
++                                              uint32_t *out_num_vectors);
++
++/*
++ * Reset the PCI device via the dext. The dext tries FLR first and falls
++ * back to a secondary bus (hot) reset if FLR isn't supported.
++ */
++kern_return_t apple_dext_reset_device(io_connect_t connection);
++
++/*
++ * Set the IRQ enable mask in the dext.  Only vectors with their
++ * corresponding bit set will be recorded as pending when the
++ * hardware fires.  mask[] is 4 x uint64_t covering 256 vectors.
++ */
++kern_return_t apple_dext_set_irq_mask(io_connect_t connection,
++                                      const uint64_t mask[4]);
++
++/*
++ * Read and clear all pending interrupt bits from the dext.
++ * Returns up to 256 bits (4 MSI/MSI-X vectors per bit) across
++ * 4 uint64_t words.  Each bit that was set is atomically cleared
++ * in the dext.
++ */
++kern_return_t apple_dext_read_pending_irqs(io_connect_t connection,
++                                           uint64_t pending[4]);
++
++/*
++ * Opaque state for async interrupt notification from the dext.
++ */
++typedef struct AppleDextInterruptNotify AppleDextInterruptNotify;
++
++/*
++ * Create async interrupt notification.  handler_fn is called on a GCD
++ * dispatch queue whenever the dext signals that one or more interrupt
++ * bits have been set.  The handler should wake the QEMU main loop,
++ * which then calls apple_dext_read_pending_irqs() to drain the bits.
++ *
++ * The notification is armed immediately upon creation.
++ */
++AppleDextInterruptNotify *
++apple_dext_interrupt_notify_create(io_connect_t connection,
++                                   void (*handler_fn)(void *opaque),
++                                   void *opaque);
++
++/*
++ * Re-arm the async interrupt notification after draining pending bits.
++ * Must be called after each wakeup to receive subsequent notifications.
++ */
++kern_return_t
++apple_dext_interrupt_notify_rearm(AppleDextInterruptNotify *notify);
++
++/*
++ * Tear down and free async interrupt notification state.
++ */
++void apple_dext_interrupt_notify_destroy(AppleDextInterruptNotify *notify);
++
++#endif /* HW_VFIO_APPLE_DEXT_CLIENT_H */
+diff --git a/hw/vfio/apple-dma.c b/hw/vfio/apple-dma.c
+new file mode 100644
+index 0000000000..bbf6a7a519
+--- /dev/null
++++ b/hw/vfio/apple-dma.c
+@@ -0,0 +1,559 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Apple DMA mapping PCI device
++ *
++ * A simple PCI device that receives batched DMA map/unmap requests from
++ * the guest via a shared command page + doorbell register, resolves guest
++ * physical addresses to host virtual addresses, and registers them with
++ * the macOS DriverKit dext for DART mapping.
++ *
++ * Protocol:
++ *   1. Guest allocates a command page and request/response buffers in RAM.
++ *   2. Guest writes the command page GPA to BAR registers (one-time setup).
++ *   3. Per batch: guest fills the command page and request buffer (no VMEXIT),
++ *      then writes the doorbell register (single VMEXIT triggers processing).
++ *   4. Device reads the command page, processes all entries, writes responses
++ *      and status back to guest RAM before the doorbell write returns.
++ *
++ * Copyright (c) 2026 Scott J. Goldman
++ */
++
++#include "qemu/osdep.h"
++
++#include "hw/pci/pci_device.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/vfio/apple-dext-client.h"
++#include "hw/vfio/apple.h"
++#include "qapi/error.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
++#include "system/address-spaces.h"
++#include "system/dma.h"
++#include "system/memory.h"
++
++#include "hw/pci/pci.h"
++
++/* BAR0 register offsets */
++#define APPLE_DMA_REG_VERSION       0x00    /* R:  protocol version */
++#define APPLE_DMA_REG_MANAGED_BDF   0x04    /* R:  guest BDF this maps for */
++#define APPLE_DMA_REG_MAX_ENTRIES   0x08    /* R:  max entries per batch */
++#define APPLE_DMA_REG_STATUS        0x0C    /* R:  result of last doorbell */
++#define APPLE_DMA_REG_CMD_GPA_LO    0x10    /* W:  command page GPA [31:0] */
++#define APPLE_DMA_REG_CMD_GPA_HI    0x14    /* W:  command page GPA [63:32] */
++#define APPLE_DMA_REG_DOORBELL      0x18    /* W:  any write triggers batch */
++#define APPLE_DMA_BAR_SIZE          0x1000  /* page-aligned */
++
++#define APPLE_DMA_VERSION           2
++#define APPLE_DMA_MAX_ENTRIES       4096
++
++/* Command types (in command page) */
++#define APPLE_DMA_CMD_MAP           1
++#define APPLE_DMA_CMD_UNMAP         2
++
++/* Status codes */
++#define APPLE_DMA_S_OK              0
++#define APPLE_DMA_S_IOERR           1
++#define APPLE_DMA_S_INVAL           3
++
++/*
++ * Command page layout (in guest RAM, 32 bytes):
++ *
++ *   0x00  uint32_t  type         MAP=1, UNMAP=2
++ *   0x04  uint32_t  count        number of entries
++ *   0x08  uint32_t  status       (written by device) 0=OK
++ *   0x0C  uint32_t  reserved
++ *   0x10  uint64_t  req_gpa      GPA of request entries array
++ *   0x18  uint64_t  resp_gpa     GPA of response entries array
++ */
++#define CMD_OFF_TYPE      0x00
++#define CMD_OFF_COUNT     0x04
++#define CMD_OFF_STATUS    0x08
++#define CMD_OFF_REQ_GPA   0x10
++#define CMD_OFF_RESP_GPA  0x18
++#define CMD_PAGE_SIZE     0x20
++
++/*
++ * Map request entry (16 bytes):
++ *   uint64_t gpa, uint32_t len, uint32_t flags
++ *
++ * Map response entry (24 bytes):
++ *   uint64_t id, uint64_t dma_addr, uint32_t dma_len, uint32_t status
++ *
++ * Unmap request entry (16 bytes):
++ *   uint64_t id, uint64_t size
++ *
++ * Unmap response entry (16 bytes):
++ *   uint64_t id, uint32_t status, uint32_t reserved
++ */
++
++typedef struct AppleDMAMapReq {
++    uint64_t gpa;
++    uint32_t len;
++    uint32_t flags;
++} QEMU_PACKED AppleDMAMapReq;
++
++typedef struct AppleDMAMapResp {
++    uint64_t id;
++    uint64_t dma_addr;
++    uint32_t dma_len;
++    uint32_t status;
++} QEMU_PACKED AppleDMAMapResp;
++
++typedef struct AppleDMAUnmapReq {
++    uint64_t id;
++    uint64_t size;
++} QEMU_PACKED AppleDMAUnmapReq;
++
++typedef struct AppleDMAUnmapResp {
++    uint64_t id;
++    uint32_t status;
++    uint32_t reserved;
++} QEMU_PACKED AppleDMAUnmapResp;
++
++#define TYPE_APPLE_DMA_PCI "apple-dma-pci"
++OBJECT_DECLARE_SIMPLE_TYPE(AppleDMAState, APPLE_DMA_PCI)
++
++struct AppleDMAState {
++    PCIDevice parent_obj;
++
++    MemoryRegion bar;
++
++    /* Configuration (set via properties) */
++    uint32_t managed_bdf;
++    uint32_t max_entries;
++    uint32_t apple_host_bus;
++    uint32_t apple_host_device;
++    uint32_t apple_host_function;
++    char *apple_host_root;
++
++    /* Runtime state */
++    uint64_t cmd_gpa;
++    uint32_t last_status;
++    io_connect_t dext_conn;
++    bool shared_dext_conn;
++};
++
++/* ------------------------------------------------------------------ */
++/* DMA backend operations                                              */
++/* ------------------------------------------------------------------ */
++
++static bool apple_dma_backend_map(AppleDMAState *s, uint64_t gpa, uint32_t size,
++                                  uint64_t *out_dma_addr, uint32_t *out_dma_len)
++{
++    hwaddr map_len = size;
++    void *hva;
++    uint64_t bus_addr = 0, bus_len = 0;
++
++    hva = dma_memory_map(&address_space_memory, gpa, &map_len,
++                         DMA_DIRECTION_TO_DEVICE, MEMTXATTRS_UNSPECIFIED);
++    if (!hva || map_len < size) {
++        if (hva) {
++            dma_memory_unmap(&address_space_memory, hva, map_len,
++                             DMA_DIRECTION_TO_DEVICE, 0);
++        }
++        return false;
++    }
++
++    /*
++     * Use the GPA as the dext lookup key. The dext treats this as an
++     * opaque handle for matching register/unregister calls; the actual
++     * DMA bus address is assigned by the platform and returned in
++     * bus_addr.
++     */
++    if (s->dext_conn != IO_OBJECT_NULL) {
++        kern_return_t kr;
++
++        kr = apple_dext_register_dma(s->dext_conn, gpa,
++                                     (uint64_t)hva, size,
++                                     &bus_addr, &bus_len);
++        dma_memory_unmap(&address_space_memory, hva, map_len,
++                         DMA_DIRECTION_TO_DEVICE, 0);
++        if (kr != KERN_SUCCESS) {
++            error_report("apple-dma: register_dma failed gpa=0x%" PRIx64
++                         " size=%" PRIu32 " kr=0x%x",
++                         gpa, size, kr);
++            return false;
++        }
++        *out_dma_addr = bus_addr;
++        *out_dma_len = (uint32_t)bus_len;
++    } else {
++        dma_memory_unmap(&address_space_memory, hva, map_len,
++                         DMA_DIRECTION_TO_DEVICE, 0);
++        *out_dma_addr = gpa;
++        *out_dma_len = size;
++    }
++
++    return true;
++}
++
++static uint32_t apple_dma_backend_unmap(AppleDMAState *s, uint64_t id)
++{
++    if (s->dext_conn != IO_OBJECT_NULL) {
++        kern_return_t kr;
++
++        kr = apple_dext_unregister_dma(s->dext_conn, id);
++        if (kr != KERN_SUCCESS) {
++            return APPLE_DMA_S_IOERR;
++        }
++    }
++
++    return APPLE_DMA_S_OK;
++}
++
++/* ------------------------------------------------------------------ */
++/* Doorbell — process a batch from the command page                    */
++/* ------------------------------------------------------------------ */
++
++static void apple_dma_handle_map(AppleDMAState *s, uint64_t req_gpa,
++                                 uint64_t resp_gpa, uint32_t count)
++{
++    AddressSpace *as = &address_space_memory;
++    hwaddr req_len = count * sizeof(AppleDMAMapReq);
++    hwaddr resp_len = count * sizeof(AppleDMAMapResp);
++    AppleDMAMapReq *reqs;
++    AppleDMAMapResp *resps;
++    uint32_t i;
++    bool ok = true;
++
++    reqs = dma_memory_map(as, req_gpa, &req_len, DMA_DIRECTION_TO_DEVICE,
++                          MEMTXATTRS_UNSPECIFIED);
++    if (!reqs || req_len < count * sizeof(AppleDMAMapReq)) {
++        if (reqs) {
++            dma_memory_unmap(as, reqs, req_len, DMA_DIRECTION_TO_DEVICE, 0);
++        }
++        s->last_status = APPLE_DMA_S_INVAL;
++        return;
++    }
++
++    resps = dma_memory_map(as, resp_gpa, &resp_len, DMA_DIRECTION_FROM_DEVICE,
++                           MEMTXATTRS_UNSPECIFIED);
++    if (!resps || resp_len < count * sizeof(AppleDMAMapResp)) {
++        if (resps) {
++            dma_memory_unmap(as, resps, resp_len,
++                             DMA_DIRECTION_FROM_DEVICE, 0);
++        }
++        dma_memory_unmap(as, reqs, req_len, DMA_DIRECTION_TO_DEVICE, 0);
++        s->last_status = APPLE_DMA_S_INVAL;
++        return;
++    }
++
++    for (i = 0; i < count; i++) {
++        uint64_t gpa = le64_to_cpu(reqs[i].gpa);
++        uint64_t dma_addr = 0;
++        uint32_t dma_len = 0;
++
++        if (apple_dma_backend_map(s, gpa, le32_to_cpu(reqs[i].len),
++                                  &dma_addr, &dma_len)) {
++            resps[i].id = cpu_to_le64(gpa);
++            resps[i].dma_addr = cpu_to_le64(dma_addr);
++            resps[i].dma_len = cpu_to_le32(dma_len);
++            resps[i].status = cpu_to_le32(APPLE_DMA_S_OK);
++        } else {
++            resps[i].status = cpu_to_le32(APPLE_DMA_S_IOERR);
++            ok = false;
++        }
++    }
++
++    s->last_status = ok ? APPLE_DMA_S_OK : APPLE_DMA_S_IOERR;
++    dma_memory_unmap(as, resps, resp_len, DMA_DIRECTION_FROM_DEVICE,
++                     resp_len);
++    dma_memory_unmap(as, reqs, req_len, DMA_DIRECTION_TO_DEVICE, 0);
++}
++
++static void apple_dma_handle_unmap(AppleDMAState *s, uint64_t req_gpa,
++                                   uint64_t resp_gpa, uint32_t count)
++{
++    AddressSpace *as = &address_space_memory;
++    hwaddr req_len = count * sizeof(AppleDMAUnmapReq);
++    hwaddr resp_len = count * sizeof(AppleDMAUnmapResp);
++    AppleDMAUnmapReq *reqs;
++    AppleDMAUnmapResp *resps;
++    uint32_t i;
++    bool ok = true;
++
++    reqs = dma_memory_map(as, req_gpa, &req_len, DMA_DIRECTION_TO_DEVICE,
++                          MEMTXATTRS_UNSPECIFIED);
++    if (!reqs || req_len < count * sizeof(AppleDMAUnmapReq)) {
++        if (reqs) {
++            dma_memory_unmap(as, reqs, req_len, DMA_DIRECTION_TO_DEVICE, 0);
++        }
++        s->last_status = APPLE_DMA_S_INVAL;
++        return;
++    }
++
++    resps = dma_memory_map(as, resp_gpa, &resp_len, DMA_DIRECTION_FROM_DEVICE,
++                           MEMTXATTRS_UNSPECIFIED);
++    if (!resps || resp_len < count * sizeof(AppleDMAUnmapResp)) {
++        if (resps) {
++            dma_memory_unmap(as, resps, resp_len,
++                             DMA_DIRECTION_FROM_DEVICE, 0);
++        }
++        dma_memory_unmap(as, reqs, req_len, DMA_DIRECTION_TO_DEVICE, 0);
++        s->last_status = APPLE_DMA_S_INVAL;
++        return;
++    }
++
++    for (i = 0; i < count; i++) {
++        uint64_t id = le64_to_cpu(reqs[i].id);
++        uint32_t status = apple_dma_backend_unmap(s, id);
++
++        resps[i].id = cpu_to_le64(id);
++        resps[i].status = cpu_to_le32(status);
++        if (status != APPLE_DMA_S_OK) {
++            ok = false;
++        }
++    }
++
++    s->last_status = ok ? APPLE_DMA_S_OK : APPLE_DMA_S_IOERR;
++    dma_memory_unmap(as, resps, resp_len, DMA_DIRECTION_FROM_DEVICE,
++                     resp_len);
++    dma_memory_unmap(as, reqs, req_len, DMA_DIRECTION_TO_DEVICE, 0);
++}
++
++static void apple_dma_doorbell(AppleDMAState *s)
++{
++    AddressSpace *as = &address_space_memory;
++    uint8_t cmd_buf[CMD_PAGE_SIZE];
++    uint32_t type, count;
++    uint64_t req_gpa, resp_gpa;
++    uint32_t le_status;
++
++    if (!s->cmd_gpa) {
++        s->last_status = APPLE_DMA_S_INVAL;
++        return;
++    }
++
++    if (dma_memory_read(as, s->cmd_gpa, cmd_buf, CMD_PAGE_SIZE,
++                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        s->last_status = APPLE_DMA_S_INVAL;
++        return;
++    }
++
++    type = ldl_le_p(cmd_buf + CMD_OFF_TYPE);
++    count = ldl_le_p(cmd_buf + CMD_OFF_COUNT);
++    req_gpa = ldq_le_p(cmd_buf + CMD_OFF_REQ_GPA);
++    resp_gpa = ldq_le_p(cmd_buf + CMD_OFF_RESP_GPA);
++
++    if (!count || count > s->max_entries || !req_gpa || !resp_gpa) {
++        s->last_status = APPLE_DMA_S_INVAL;
++        goto write_status;
++    }
++
++    switch (type) {
++    case APPLE_DMA_CMD_MAP:
++        apple_dma_handle_map(s, req_gpa, resp_gpa, count);
++        break;
++    case APPLE_DMA_CMD_UNMAP:
++        apple_dma_handle_unmap(s, req_gpa, resp_gpa, count);
++        break;
++    default:
++        s->last_status = APPLE_DMA_S_INVAL;
++        break;
++    }
++
++write_status:
++    le_status = cpu_to_le32(s->last_status);
++    dma_memory_write(as, s->cmd_gpa + CMD_OFF_STATUS, &le_status, 4,
++                     MEMTXATTRS_UNSPECIFIED);
++}
++
++/* ------------------------------------------------------------------ */
++/* MMIO BAR handlers                                                   */
++/* ------------------------------------------------------------------ */
++
++static uint64_t apple_dma_bar_read(void *opaque, hwaddr addr, unsigned size)
++{
++    AppleDMAState *s = opaque;
++
++    switch (addr) {
++    case APPLE_DMA_REG_VERSION:
++        return APPLE_DMA_VERSION;
++    case APPLE_DMA_REG_MANAGED_BDF:
++        return s->managed_bdf;
++    case APPLE_DMA_REG_MAX_ENTRIES:
++        return s->max_entries;
++    case APPLE_DMA_REG_STATUS:
++        return s->last_status;
++    default:
++        return 0;
++    }
++}
++
++static void apple_dma_bar_write(void *opaque, hwaddr addr, uint64_t val,
++                                unsigned size)
++{
++    AppleDMAState *s = opaque;
++
++    switch (addr) {
++    case APPLE_DMA_REG_CMD_GPA_LO:
++        s->cmd_gpa = deposit64(s->cmd_gpa, 0, 32, val);
++        break;
++    case APPLE_DMA_REG_CMD_GPA_HI:
++        s->cmd_gpa = deposit64(s->cmd_gpa, 32, 32, val);
++        break;
++    case APPLE_DMA_REG_DOORBELL:
++        apple_dma_doorbell(s);
++        break;
++    default:
++        break;
++    }
++}
++
++static const MemoryRegionOps apple_dma_bar_ops = {
++    .read = apple_dma_bar_read,
++    .write = apple_dma_bar_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++/* ------------------------------------------------------------------ */
++/* Dext connection                                                     */
++/* ------------------------------------------------------------------ */
++
++static bool apple_dma_connect_dext(AppleDMAState *s, Error **errp)
++{
++    io_connect_t conn;
++    kern_return_t kr;
++
++    const char *root = (s->apple_host_root && s->apple_host_root[0])
++                           ? s->apple_host_root : NULL;
++    char *connect_err = NULL;
++
++    conn = apple_vfio_dext_lookup(s->apple_host_bus, s->apple_host_device,
++                                  s->apple_host_function, root);
++    if (conn != IO_OBJECT_NULL) {
++        s->dext_conn = conn;
++        s->shared_dext_conn = true;
++        return true;
++    }
++
++    conn = apple_dext_connect_with_root(s->apple_host_bus,
++                                        s->apple_host_device,
++                                        s->apple_host_function,
++                                        root, &connect_err);
++    if (conn == IO_OBJECT_NULL) {
++        if (connect_err) {
++            error_setg(errp, "apple-dma: %s", connect_err);
++            free(connect_err);
++        } else {
++            error_setg(errp,
++                       "apple-dma: could not connect to dext for host PCI "
++                       "%02x:%02x.%x",
++                       s->apple_host_bus, s->apple_host_device,
++                       s->apple_host_function);
++        }
++        return false;
++    }
++
++    kr = apple_dext_claim(conn);
++    if (kr != KERN_SUCCESS) {
++        error_setg(errp,
++                   "apple-dma: failed to claim dext-backed PCI device "
++                   "%02x:%02x.%x (kr=0x%x)",
++                   s->apple_host_bus, s->apple_host_device,
++                   s->apple_host_function, kr);
++        apple_dext_disconnect(conn);
++        return false;
++    }
++
++    s->dext_conn = conn;
++    s->shared_dext_conn = false;
++    return true;
++}
++
++/* ------------------------------------------------------------------ */
++/* PCI device lifecycle                                                */
++/* ------------------------------------------------------------------ */
++
++static void apple_dma_pci_realize(PCIDevice *pdev, Error **errp)
++{
++    AppleDMAState *s = APPLE_DMA_PCI(pdev);
++
++    if (s->apple_host_bus == UINT32_MAX ||
++        s->apple_host_device == UINT32_MAX ||
++        s->apple_host_function == UINT32_MAX) {
++        error_setg(errp, "apple-dma: requires x-apple-host-bus, "
++                   "x-apple-host-device, and x-apple-host-function");
++        return;
++    }
++
++    if (!s->max_entries) {
++        s->max_entries = APPLE_DMA_MAX_ENTRIES;
++    }
++
++    if (!apple_dma_connect_dext(s, errp)) {
++        return;
++    }
++
++    memory_region_init_io(&s->bar, OBJECT(s), &apple_dma_bar_ops, s,
++                          "apple-dma-bar", APPLE_DMA_BAR_SIZE);
++    pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
++}
++
++static void apple_dma_pci_exit(PCIDevice *pdev)
++{
++    AppleDMAState *s = APPLE_DMA_PCI(pdev);
++
++    if (s->dext_conn != IO_OBJECT_NULL) {
++        const char *root = (s->apple_host_root && s->apple_host_root[0])
++                               ? s->apple_host_root : NULL;
++        if (s->shared_dext_conn) {
++            apple_vfio_dext_release(s->apple_host_bus, s->apple_host_device,
++                                    s->apple_host_function, root,
++                                    s->dext_conn);
++        } else {
++            apple_dext_disconnect(s->dext_conn);
++        }
++        s->dext_conn = IO_OBJECT_NULL;
++    }
++}
++
++static const Property apple_dma_pci_properties[] = {
++    DEFINE_PROP_UINT32("managed-bdf", AppleDMAState, managed_bdf, 0),
++    DEFINE_PROP_UINT32("max-entries", AppleDMAState, max_entries, 0),
++    DEFINE_PROP_UINT32("x-apple-host-bus", AppleDMAState,
++                       apple_host_bus, UINT32_MAX),
++    DEFINE_PROP_UINT32("x-apple-host-device", AppleDMAState,
++                       apple_host_device, UINT32_MAX),
++    DEFINE_PROP_UINT32("x-apple-host-function", AppleDMAState,
++                       apple_host_function, UINT32_MAX),
++    DEFINE_PROP_STRING("x-apple-host-root", AppleDMAState, apple_host_root),
++};
++
++static void apple_dma_pci_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *pdc = PCI_DEVICE_CLASS(klass);
++
++    pdc->realize = apple_dma_pci_realize;
++    pdc->exit = apple_dma_pci_exit;
++    pdc->vendor_id = PCI_VENDOR_ID_REDHAT;
++    pdc->device_id = PCI_DEVICE_ID_REDHAT_APPLE_DMA;
++    pdc->class_id = PCI_CLASS_SYSTEM_OTHER;
++
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++    device_class_set_props(dc, apple_dma_pci_properties);
++    dc->desc = "Apple DMA mapping device";
++}
++
++static const TypeInfo apple_dma_pci_info = {
++    .name = TYPE_APPLE_DMA_PCI,
++    .parent = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(AppleDMAState),
++    .class_init = apple_dma_pci_class_init,
++    .interfaces = (const InterfaceInfo[]) {
++        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++        { },
++    },
++};
++
++static void apple_dma_pci_register(void)
++{
++    type_register_static(&apple_dma_pci_info);
++}
++
++type_init(apple_dma_pci_register)
+diff --git a/hw/vfio/apple-fdt.c b/hw/vfio/apple-fdt.c
+new file mode 100644
+index 0000000000..47b75cbc9f
+--- /dev/null
++++ b/hw/vfio/apple-fdt.c
+@@ -0,0 +1,74 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * FDT generator for vfio-apple-pci bounce-buffer reserved memory.
++ *
++ * Lives in a per-target source file (specific_ss) so it can reference
++ * libfdt helpers gated on CONFIG_DEVICE_TREE; apple-device.c itself is
++ * compiled once for all softmmu targets and cannot pull in libfdt.
++ *
++ * Copyright (c) 2026 Scott J. Goldman
++ */
++
++#include "qemu/osdep.h"
++
++#include "hw/pci/pci.h"
++#include "hw/vfio/apple.h"
++#include "system/device_tree.h"
++
++void apple_vfio_add_bounce_fdt_nodes(void *fdt, const char *pciehb_nodename)
++{
++    VFIOAppleBounceList *list = apple_vfio_get_bounce_buffers();
++    VFIOAppleBounceBuffer *bb;
++    bool have_reserved_memory = false;
++    int pool_idx = 0;
++
++    QLIST_FOREACH(bb, list, next) {
++        char *pool_node, *dev_node;
++        uint32_t phandle;
++
++        if (!bb->mapped) {
++            continue;
++        }
++
++        if (!have_reserved_memory) {
++            qemu_fdt_add_subnode(fdt, "/reserved-memory");
++            qemu_fdt_setprop_cell(fdt, "/reserved-memory",
++                                  "#address-cells", 2);
++            qemu_fdt_setprop_cell(fdt, "/reserved-memory", "#size-cells", 2);
++            qemu_fdt_setprop(fdt, "/reserved-memory", "ranges", NULL, 0);
++            have_reserved_memory = true;
++        }
++
++        phandle = qemu_fdt_alloc_phandle(fdt);
++
++        pool_node = g_strdup_printf("/reserved-memory/dma-pool%d@%" PRIx64,
++                                    pool_idx, bb->iova);
++        qemu_fdt_add_subnode(fdt, pool_node);
++        qemu_fdt_setprop_string(fdt, pool_node,
++                                "compatible", "restricted-dma-pool");
++        qemu_fdt_setprop_sized_cells(fdt, pool_node, "reg",
++                                     2, bb->iova, 2, bb->size);
++        qemu_fdt_setprop_cell(fdt, pool_node, "phandle", phandle);
++        g_free(pool_node);
++
++        dev_node = g_strdup_printf("%s/vfio@%x,%x", pciehb_nodename,
++                                   PCI_SLOT(PCI_DEVFN(bb->pci_slot,
++                                                      bb->pci_func)),
++                                   PCI_FUNC(PCI_DEVFN(bb->pci_slot,
++                                                      bb->pci_func)));
++        qemu_fdt_add_subnode(fdt, dev_node);
++        /*
++         * PCI device DT reg: phys.hi = config space address encoding,
++         * phys.mid = phys.lo = 0, size.hi = size.lo = 0.
++         */
++        qemu_fdt_setprop_cells(fdt, dev_node, "reg",
++                               (bb->pci_bus << 16) |
++                               (PCI_DEVFN(bb->pci_slot, bb->pci_func) << 8),
++                               0, 0, 0, 0);
++        qemu_fdt_setprop_cell(fdt, dev_node, "memory-region", phandle);
++        g_free(dev_node);
++
++        pool_idx++;
++    }
++}
+diff --git a/hw/vfio/apple.h b/hw/vfio/apple.h
+new file mode 100644
+index 0000000000..b5ef5e894a
+--- /dev/null
++++ b/hw/vfio/apple.h
+@@ -0,0 +1,122 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Apple/macOS VFIO passthrough common definitions.
++ *
++ * Copyright (c) 2026 Scott J. Goldman
++ */
++
++#ifndef HW_VFIO_APPLE_H
++#define HW_VFIO_APPLE_H
++
++#include <stdint.h>
++
++#include "hw/vfio/pci.h"
++#include "hw/vfio/vfio-container.h"
++#include "qapi/error.h"
++#include "qemu/event_notifier.h"
++#include "qemu/queue.h"
++
++#ifdef CONFIG_DARWIN
++#include <IOKit/IOKitLib.h>
++#else
++typedef uintptr_t io_connect_t;
++#define IO_OBJECT_NULL ((io_connect_t)0)
++#endif
++
++OBJECT_DECLARE_SIMPLE_TYPE(AppleVFIOContainer, VFIO_IOMMU_APPLE)
++
++struct AppleVFIOContainer {
++    VFIOContainer parent_obj;
++    io_connect_t dext_conn;
++    uint8_t host_bus;
++    uint8_t host_device;
++    uint8_t host_function;
++    /*
++     * Optional host PCI root name used to disambiguate when multiple
++     * VFIOUserPCIDriver instances share the same BDF. NULL means
++     * "uniquely matched without a hint". Owned by this struct.
++     */
++    char *host_root;
++};
++
++typedef struct AppleDextInterruptNotify AppleDextInterruptNotify;
++
++typedef struct AppleVFIOBarMap {
++    void *addr;
++    size_t size;
++} AppleVFIOBarMap;
++
++typedef struct AppleVFIOState {
++    AppleDextInterruptNotify *irq_notify;
++    EventNotifier irq_notifier;
++    uint32_t num_irq_vectors;
++    AppleVFIOBarMap bar_maps[PCI_ROM_SLOT];
++} AppleVFIOState;
++
++OBJECT_DECLARE_SIMPLE_TYPE(VFIOApplePCIDevice, VFIO_APPLE_PCI)
++
++typedef struct VFIOAppleBounceBuffer {
++    MemoryRegion mr;            /* RAM backing the bounce buffer */
++    void *host_addr;            /* mmap'd host virtual address */
++    uint64_t iova;              /* IOVA returned by PrepareForDMA */
++    uint64_t size;              /* total span in bytes (including gaps) */
++    bool mapped;                /* true once identity-mapped in guest */
++    uint8_t pci_bus;            /* guest PCI bus number */
++    uint8_t pci_slot;           /* guest PCI slot */
++    uint8_t pci_func;           /* guest PCI function */
++    QLIST_ENTRY(VFIOAppleBounceBuffer) next;
++} VFIOAppleBounceBuffer;
++
++struct VFIOApplePCIDevice {
++    VFIOPCIDevice parent_obj;
++    AppleVFIOState *apple;
++    DeviceState *dma_companion;
++    bool dma_companion_autocreated;
++    bool use_dma_companion;
++    uint64_t dma_bounce_size;
++    VFIOAppleBounceBuffer *bounce;
++    /*
++     * Optional `host-root=` property: the registry-entry name of the
++     * topmost IOPCIDevice ancestor for the dext instance to bind to
++     * (e.g. "pcic0-bridge"). Required only if multiple VFIOUserPCIDriver
++     * instances claim the same BDF. NULL when the user didn't set it.
++     */
++    char *host_root;
++};
++
++extern VFIODeviceIOOps apple_vfio_device_io_ops;
++
++bool apple_vfio_device_setup(VFIOApplePCIDevice *adev, Error **errp);
++void apple_vfio_device_cleanup(VFIOApplePCIDevice *adev);
++bool apple_vfio_get_bar_info(VFIOApplePCIDevice *adev, uint8_t bar,
++                             uint8_t *mem_idx, uint64_t *size,
++                             uint8_t *type);
++
++/*
++ * Shared dext-connection cache: a single io_connect_t is opened by the
++ * vfio-apple-pci container and shared with the matching apple-dma-pci
++ * companion. The cache is keyed by (bus, device, function, host_root)
++ * so devices that share a BDF under different host roots stay distinct.
++ * `host_root` may be NULL on both publish and lookup; NULL is treated
++ * as a distinct key from any non-NULL string.
++ */
++bool apple_vfio_dext_publish(uint8_t bus, uint8_t device, uint8_t function,
++                             const char *host_root, io_connect_t conn);
++io_connect_t apple_vfio_dext_lookup(uint8_t bus, uint8_t device,
++                                    uint8_t function,
++                                    const char *host_root);
++void apple_vfio_dext_release(uint8_t bus, uint8_t device, uint8_t function,
++                             const char *host_root, io_connect_t conn);
++
++/*
++ * Global list of bounce buffers registered by vfio-apple-pci devices.
++ * Used by the machine's DTB generator to add restricted-dma-pool nodes.
++ */
++typedef QLIST_HEAD(VFIOAppleBounceList, VFIOAppleBounceBuffer)
++    VFIOAppleBounceList;
++
++VFIOAppleBounceList *apple_vfio_get_bounce_buffers(void);
++void apple_vfio_add_bounce_fdt_nodes(void *fdt, const char *pciehb_nodename);
++
++#endif /* HW_VFIO_APPLE_H */
+diff --git a/hw/vfio/ccw.c b/hw/vfio/ccw.c
+index c3dc7c1962..6d5307e568 100644
+--- a/hw/vfio/ccw.c
++++ b/hw/vfio/ccw.c
+@@ -241,7 +241,7 @@ static void vfio_ccw_reset(DeviceState *dev)
+ {
+     VFIOCCWDevice *vcdev = VFIO_CCW(dev);
+ 
+-    ioctl(vcdev->vdev.fd, VFIO_DEVICE_RESET);
++    vcdev->vdev.io_ops->device_reset(&vcdev->vdev);
+ }
+ 
+ static void vfio_ccw_crw_read(VFIOCCWDevice *vcdev)
+diff --git a/hw/vfio/container-apple.c b/hw/vfio/container-apple.c
+new file mode 100644
+index 0000000000..3950129da4
+--- /dev/null
++++ b/hw/vfio/container-apple.c
+@@ -0,0 +1,261 @@
++/*
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Apple/macOS VFIO IOMMU container backend.
++ *
++ * Copyright (c) 2026 Scott J. Goldman
++ */
++
++#include "qemu/osdep.h"
++
++#include <linux/vfio.h>
++
++#include "apple-dext-client.h"
++#include "hw/vfio/apple.h"
++#include "hw/vfio/vfio-device.h"
++#include "hw/vfio/vfio-listener.h"
++#include "qapi/error.h"
++#include "system/ramblock.h"
++
++static bool apple_vfio_setup(VFIOContainer *bcontainer, Error **errp)
++{
++    bcontainer->pgsizes = qemu_real_host_page_size();
++    bcontainer->dma_max_mappings = UINT_MAX;
++    bcontainer->dirty_pages_supported = false;
++    bcontainer->max_dirty_bitmap_size = 0;
++    bcontainer->dirty_pgsizes = 0;
++    return true;
++}
++
++/*
++ * DMA map/unmap are no-ops: Apple passthrough handles DMA mapping through
++ * the companion apple-dma-pci device which talks to the dext directly,
++ * bypassing the IOMMU container's DMA path.  The stubs are required because
++ * the VFIO listener asserts they are non-NULL.
++ */
++static int apple_vfio_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
++                              uint64_t size, void *vaddr, bool readonly,
++                              MemoryRegion *mr)
++{
++    return 0;
++}
++
++static int apple_vfio_dma_unmap(const VFIOContainer *bcontainer, hwaddr iova,
++                                uint64_t size, IOMMUTLBEntry *iotlb,
++                                bool unmap_all)
++{
++    return 0;
++}
++
++static int apple_vfio_set_dirty_page_tracking(const VFIOContainer *bcontainer,
++                                              bool start, Error **errp)
++{
++    error_setg_errno(errp, ENOTSUP, "vfio-apple does not support migration");
++    return -ENOTSUP;
++}
++
++static int apple_vfio_query_dirty_bitmap(const VFIOContainer *bcontainer,
++                                         VFIOBitmap *vbmap, hwaddr iova,
++                                         hwaddr size, uint64_t backend_flag,
++                                         Error **errp)
++{
++    error_setg_errno(errp, ENOTSUP, "vfio-apple does not support migration");
++    return -ENOTSUP;
++}
++
++static int apple_vfio_pci_hot_reset(VFIODevice *vbasedev, bool single)
++{
++    return 0;
++}
++
++static AppleVFIOContainer *apple_vfio_container_connect(AddressSpace *as,
++                                                        VFIODevice *vbasedev,
++                                                        Error **errp)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(vbasedev->dev);
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    AppleVFIOContainer *container;
++    VFIOContainer *bcontainer;
++    VFIOAddressSpace *space;
++    VFIOIOMMUClass *vioc;
++    int ret;
++    char *connect_err = NULL;
++
++    space = vfio_address_space_get(as);
++    container = VFIO_IOMMU_APPLE(object_new(TYPE_VFIO_IOMMU_APPLE));
++    bcontainer = VFIO_IOMMU(container);
++    vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
++
++    container->host_bus = vdev->host.bus;
++    container->host_device = vdev->host.slot;
++    container->host_function = vdev->host.function;
++    container->host_root = (adev->host_root && adev->host_root[0])
++                               ? g_strdup(adev->host_root)
++                               : NULL;
++
++    ret = ram_block_uncoordinated_discard_disable(true);
++    if (ret) {
++        error_setg_errno(errp, -ret, "Cannot set discarding of RAM broken");
++        goto fail_unref;
++    }
++
++    container->dext_conn = apple_dext_connect_with_root(container->host_bus,
++                                                        container->host_device,
++                                                        container->host_function,
++                                                        container->host_root,
++                                                        &connect_err);
++    if (container->dext_conn == IO_OBJECT_NULL) {
++        if (connect_err) {
++            error_setg(errp, "vfio-apple: %s", connect_err);
++            free(connect_err);
++        } else {
++            error_setg(errp,
++                       "vfio-apple: could not connect to dext for host PCI "
++                       "%02x:%02x.%x",
++                       container->host_bus, container->host_device,
++                       container->host_function);
++        }
++        goto fail_discards;
++    }
++
++    if (apple_dext_claim(container->dext_conn) != KERN_SUCCESS) {
++        error_setg(errp,
++                   "vfio-apple: failed to claim dext-backed PCI device "
++                   "%02x:%02x.%x",
++                   container->host_bus, container->host_device,
++                   container->host_function);
++        goto fail_release_conn;
++    }
++
++    if (!apple_vfio_dext_publish(container->host_bus, container->host_device,
++                                 container->host_function,
++                                 container->host_root,
++                                 container->dext_conn)) {
++        error_setg(errp,
++                   "vfio-apple: duplicate dext owner for host PCI %02x:%02x.%x"
++                   "%s%s",
++                   container->host_bus, container->host_device,
++                   container->host_function,
++                   container->host_root ? "@" : "",
++                   container->host_root ? container->host_root : "");
++        goto fail_release_conn;
++    }
++
++    if (!vioc->setup(bcontainer, errp)) {
++        goto fail_shared_conn;
++    }
++
++    vfio_address_space_insert(space, bcontainer);
++
++    if (!vfio_listener_register(bcontainer, errp)) {
++        goto fail_address_space;
++    }
++
++    bcontainer->initialized = true;
++    return container;
++
++fail_address_space:
++    vfio_listener_unregister(bcontainer);
++    QLIST_REMOVE(bcontainer, next);
++    bcontainer->space = NULL;
++fail_shared_conn:
++    apple_vfio_dext_release(container->host_bus, container->host_device,
++                            container->host_function, container->host_root,
++                            container->dext_conn);
++    container->dext_conn = IO_OBJECT_NULL;
++fail_discards:
++    ram_block_uncoordinated_discard_disable(false);
++fail_unref:
++    g_clear_pointer(&container->host_root, g_free);
++    object_unref(container);
++    vfio_address_space_put(space);
++    return NULL;
++
++fail_release_conn:
++    apple_dext_disconnect(container->dext_conn);
++    container->dext_conn = IO_OBJECT_NULL;
++    goto fail_discards;
++}
++
++static void apple_vfio_container_disconnect(AppleVFIOContainer *container)
++{
++    VFIOContainer *bcontainer = VFIO_IOMMU(container);
++    VFIOAddressSpace *space = bcontainer->space;
++
++    ram_block_uncoordinated_discard_disable(false);
++    vfio_listener_unregister(bcontainer);
++
++    apple_vfio_dext_release(container->host_bus, container->host_device,
++                            container->host_function, container->host_root,
++                            container->dext_conn);
++    container->dext_conn = IO_OBJECT_NULL;
++    g_clear_pointer(&container->host_root, g_free);
++
++    object_unref(container);
++    vfio_address_space_put(space);
++}
++
++static bool apple_vfio_attach_device(const char *name, VFIODevice *vbasedev,
++                                     AddressSpace *as, Error **errp)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    AppleVFIOContainer *container;
++    struct vfio_device_info info = {
++        .argsz = sizeof(info),
++        .flags = VFIO_DEVICE_FLAGS_PCI | VFIO_DEVICE_FLAGS_RESET,
++        .num_regions = VFIO_PCI_NUM_REGIONS,
++        .num_irqs = VFIO_PCI_NUM_IRQS,
++    };
++
++    container = apple_vfio_container_connect(as, vbasedev, errp);
++    if (!container) {
++        return false;
++    }
++
++    vbasedev->fd = -1;
++    vbasedev->io_ops = &apple_vfio_device_io_ops;
++    vfio_device_prepare(vbasedev, VFIO_IOMMU(container), &info);
++
++    if (!apple_vfio_device_setup(adev, errp)) {
++        vfio_device_unprepare(vbasedev);
++        apple_vfio_container_disconnect(container);
++        return false;
++    }
++
++    return true;
++}
++
++static void apple_vfio_detach_device(VFIODevice *vbasedev)
++{
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
++    AppleVFIOContainer *container = VFIO_IOMMU_APPLE(vbasedev->bcontainer);
++
++    apple_vfio_device_cleanup(adev);
++    vfio_device_unprepare(vbasedev);
++    apple_vfio_container_disconnect(container);
++}
++
++static void vfio_iommu_apple_class_init(ObjectClass *klass, const void *data)
++{
++    VFIOIOMMUClass *vioc = VFIO_IOMMU_CLASS(klass);
++
++    vioc->setup = apple_vfio_setup;
++    vioc->dma_map = apple_vfio_dma_map;
++    vioc->dma_unmap = apple_vfio_dma_unmap;
++    vioc->attach_device = apple_vfio_attach_device;
++    vioc->detach_device = apple_vfio_detach_device;
++    vioc->set_dirty_page_tracking = apple_vfio_set_dirty_page_tracking;
++    vioc->query_dirty_bitmap = apple_vfio_query_dirty_bitmap;
++    vioc->pci_hot_reset = apple_vfio_pci_hot_reset;
++}
++
++static const TypeInfo apple_vfio_types[] = {
++    {
++        .name = TYPE_VFIO_IOMMU_APPLE,
++        .parent = TYPE_VFIO_IOMMU,
++        .instance_size = sizeof(AppleVFIOContainer),
++        .class_init = vfio_iommu_apple_class_init,
++    },
++};
++
++DEFINE_TYPES(apple_vfio_types)
+diff --git a/hw/vfio/device.c b/hw/vfio/device.c
+index 1a7f8088aa..0e53e7b88d 100644
+--- a/hw/vfio/device.c
++++ b/hw/vfio/device.c
+@@ -23,6 +23,7 @@
+ 
+ #include "hw/vfio/vfio-device.h"
+ #include "hw/vfio/pci.h"
++#include "hw/vfio/vfio-region.h"
+ #include "hw/core/iommu.h"
+ #include "trace.h"
+ #include "qapi/error.h"
+@@ -315,6 +316,13 @@ bool vfio_device_get_name(VFIODevice *vbasedev, Error **errp)
+     struct stat st;
+ 
+     if (vbasedev->fd < 0) {
++        if (!vbasedev->sysfsdev) {
++            if (vbasedev->name) {
++                return true;
++            }
++            error_setg(errp, "No provided host device");
++            return false;
++        }
+         if (stat(vbasedev->sysfsdev, &st) < 0) {
+             error_setg_errno(errp, errno, "no such host device");
+             error_prepend(errp, VFIO_MSG_PREFIX, vbasedev->sysfsdev);
+@@ -403,7 +411,16 @@ bool vfio_device_is_mdev(VFIODevice *vbasedev)
+     g_autofree char *tmp = NULL;
+ 
+     if (!vbasedev->sysfsdev) {
++#ifdef CONFIG_DARWIN
++        /*
++         * On Darwin the dext mediates all device access and manages DMA
++         * mappings explicitly, so the mdev assumptions (software-managed
++         * DMA, balloon-safe) hold.
++         */
++        return true;
++#else
+         return false;
++#endif
+     }
+ 
+     tmp = g_strdup_printf("%s/subsystem", vbasedev->sysfsdev);
+@@ -461,9 +478,13 @@ bool vfio_device_attach_by_iommu_type(const char *iommu_type, char *name,
+ bool vfio_device_attach(char *name, VFIODevice *vbasedev,
+                         AddressSpace *as, Error **errp)
+ {
++#ifdef CONFIG_DARWIN
++    const char *iommu_type = TYPE_VFIO_IOMMU_APPLE;
++#else
+     const char *iommu_type = vbasedev->iommufd ?
+                              TYPE_VFIO_IOMMU_IOMMUFD :
+                              TYPE_VFIO_IOMMU_LEGACY;
++#endif
+ 
+     return vfio_device_attach_by_iommu_type(iommu_type, name, vbasedev,
+                                             as, errp);
+@@ -657,6 +678,24 @@ static int vfio_device_io_region_write(VFIODevice *vbasedev, uint8_t index,
+     return ret < 0 ? -errno : ret;
+ }
+ 
++static int vfio_device_io_device_reset(VFIODevice *vbasedev)
++{
++    int ret = ioctl(vbasedev->fd, VFIO_DEVICE_RESET);
++
++    return ret < 0 ? -errno : ret;
++}
++
++static int vfio_device_io_region_map(VFIODevice *vbasedev, VFIORegion *region)
++{
++    return vfio_region_mmap_fd(region);
++}
++
++static void vfio_device_io_region_unmap(VFIODevice *vbasedev,
++                                        VFIORegion *region)
++{
++    vfio_region_unmap_fd(region);
++}
++
+ static VFIODeviceIOOps vfio_device_io_ops_ioctl = {
+     .capabilities = VFIO_IO_CAP_DMA_BUF,
+ 
+@@ -664,6 +703,9 @@ static VFIODeviceIOOps vfio_device_io_ops_ioctl = {
+     .get_region_info = vfio_device_io_get_region_info,
+     .get_irq_info = vfio_device_io_get_irq_info,
+     .set_irqs = vfio_device_io_set_irqs,
++    .device_reset = vfio_device_io_device_reset,
+     .region_read = vfio_device_io_region_read,
+     .region_write = vfio_device_io_region_write,
++    .region_map = vfio_device_io_region_map,
++    .region_unmap = vfio_device_io_region_unmap,
+ };
+diff --git a/hw/vfio/meson.build b/hw/vfio/meson.build
+index c7c31b78f6..b9405f3616 100644
+--- a/hw/vfio/meson.build
++++ b/hw/vfio/meson.build
+@@ -4,10 +4,13 @@ vfio_ss = ss.source_set()
+ vfio_ss.add(files(
+   'listener.c',
+   'container.c',
+-  'container-legacy.c',
+   'helpers.c',
+ ))
+-vfio_ss.add(when: 'CONFIG_KVM', if_true: files('kvm-helpers.c'))
++vfio_ss.add(when: 'CONFIG_LINUX', if_true: files('container-legacy.c'))
++vfio_ss.add(when: 'CONFIG_KVM', if_true: files(
++  'kvm-helpers.c',
++  'container-legacy.c'
++))
+ stub_ss.add(files('kvm-stubs.c'))
+ vfio_ss.add(when: 'CONFIG_PSERIES', if_true: files('spapr.c'))
+ vfio_ss.add(when: ['CONFIG_KVM', 'CONFIG_PSERIES'], if_true: files('kvm-spapr.c'))
+@@ -38,3 +41,17 @@ stub_ss.add(files('iommufd-stubs.c'))
+ system_ss.add(when: 'CONFIG_VFIO_PCI', if_true: files(
+   'display.c',
+ ))
++
++# Apple VFIO backend
++if host_os == 'darwin'
++  system_ss.add(when: 'CONFIG_VFIO',
++                if_true: [files('apple-device.c', 'apple-dma.c',
++                                'container-apple.c', 'apple-dext-client.c'),
++                          coref, iokit])
++  # FDT helper lives in specific_ss because libfdt is only linked into
++  # targets that set CONFIG_DEVICE_TREE; system_ss is compiled once and
++  # shared across all softmmu targets. The only caller is hw/arm/virt.c,
++  # so gate on CONFIG_ARM_VIRT to avoid compiling it into other targets.
++  specific_ss.add(when: ['CONFIG_VFIO', 'CONFIG_ARM_VIRT'],
++                  if_true: files('apple-fdt.c'))
++endif
+diff --git a/hw/vfio/migration.c b/hw/vfio/migration.c
+index 73c49d8c24..c6abc5d2cd 100644
+--- a/hw/vfio/migration.c
++++ b/hw/vfio/migration.c
+@@ -222,9 +222,10 @@ int vfio_migration_set_state(VFIODevice *vbasedev,
+     return 0;
+ 
+ reset_device:
+-    if (ioctl(vbasedev->fd, VFIO_DEVICE_RESET)) {
++    ret = vbasedev->io_ops->device_reset(vbasedev);
++    if (ret) {
+         hw_error("%s: Failed resetting device, err: %s", vbasedev->name,
+-                 strerror(errno));
++                 strerror(-ret));
+     }
+ 
+     vfio_migration_set_device_state(vbasedev, VFIO_DEVICE_STATE_RUNNING);
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 428ab2f069..990087318a 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -80,6 +80,17 @@ static bool vfio_notifier_init(VFIOPCIDevice *vdev, EventNotifier *e,
+     return true;
+ }
+ 
++/*
++ * Return the fd that the vfio kernel driver or vfio-user server should
++ * write to in order to signal an interrupt.  For eventfd-backed notifiers
++ * this is the same descriptor QEMU reads, but on hosts that emulate
++ * EventNotifier with a pipe pair the write side must be used instead.
++ */
++static int vfio_irq_signal_fd(EventNotifier *e)
++{
++    return event_notifier_get_wfd(e);
++}
++
+ static void vfio_notifier_cleanup(VFIOPCIDevice *vdev, EventNotifier *e,
+                                   const char *name, int nr)
+ {
+@@ -379,7 +390,9 @@ static bool vfio_intx_enable(VFIOPCIDevice *vdev, Error **errp)
+     }
+ 
+     if (!vfio_device_irq_set_signaling(&vdev->vbasedev, VFIO_PCI_INTX_IRQ_INDEX, 0,
+-                                VFIO_IRQ_SET_ACTION_TRIGGER, fd, errp)) {
++                                VFIO_IRQ_SET_ACTION_TRIGGER,
++                                vfio_irq_signal_fd(&vdev->intx.interrupt),
++                                errp)) {
+         qemu_set_fd_handler(fd, NULL, NULL, vdev);
+         vfio_notifier_cleanup(vdev, &vdev->intx.interrupt, "intx-interrupt", 0);
+         return false;
+@@ -556,9 +569,9 @@ static int vfio_enable_vectors(VFIOPCIDevice *vdev, bool msix)
+         if (vdev->msi_vectors[i].use) {
+             if (vdev->msi_vectors[i].virq < 0 ||
+                 (msix && msix_is_masked(pdev, i))) {
+-                fd = event_notifier_get_fd(&vdev->msi_vectors[i].interrupt);
++                fd = vfio_irq_signal_fd(&vdev->msi_vectors[i].interrupt);
+             } else {
+-                fd = event_notifier_get_fd(&vdev->msi_vectors[i].kvm_interrupt);
++                fd = vfio_irq_signal_fd(&vdev->msi_vectors[i].kvm_interrupt);
+             }
+         }
+ 
+@@ -636,9 +649,9 @@ static void set_irq_signalling(VFIODevice *vbasedev, VFIOMSIVector *vector,
+     int32_t fd;
+ 
+     if (vector->virq >= 0) {
+-        fd = event_notifier_get_fd(&vector->kvm_interrupt);
++        fd = vfio_irq_signal_fd(&vector->kvm_interrupt);
+     } else {
+-        fd = event_notifier_get_fd(&vector->interrupt);
++        fd = vfio_irq_signal_fd(&vector->interrupt);
+     }
+ 
+     if (!vfio_device_irq_set_signaling(vbasedev, VFIO_PCI_MSIX_IRQ_INDEX, nr,
+@@ -778,7 +791,7 @@ static void vfio_msix_vector_release(PCIDevice *pdev, unsigned int nr)
+      * be re-asserted on unmask.  Nothing to do if already using QEMU mode.
+      */
+     if (vector->virq >= 0) {
+-        int32_t fd = event_notifier_get_fd(&vector->interrupt);
++        int32_t fd = vfio_irq_signal_fd(&vector->interrupt);
+         Error *err = NULL;
+ 
+         if (!vfio_device_irq_set_signaling(&vdev->vbasedev, VFIO_PCI_MSIX_IRQ_INDEX,
+@@ -3294,7 +3307,9 @@ void vfio_pci_register_err_notifier(VFIOPCIDevice *vdev)
+     }
+ 
+     if (!vfio_device_irq_set_signaling(&vdev->vbasedev, VFIO_PCI_ERR_IRQ_INDEX, 0,
+-                                       VFIO_IRQ_SET_ACTION_TRIGGER, fd, &err)) {
++                                       VFIO_IRQ_SET_ACTION_TRIGGER,
++                                       vfio_irq_signal_fd(&vdev->err_notifier),
++                                       &err)) {
+         error_reportf_err(err, VFIO_MSG_PREFIX, vdev->vbasedev.name);
+         qemu_set_fd_handler(fd, NULL, NULL, vdev);
+         vfio_notifier_cleanup(vdev, &vdev->err_notifier, "err_notifier", 0);
+@@ -3367,7 +3382,9 @@ void vfio_pci_register_req_notifier(VFIOPCIDevice *vdev)
+     }
+ 
+     if (!vfio_device_irq_set_signaling(&vdev->vbasedev, VFIO_PCI_REQ_IRQ_INDEX, 0,
+-                                       VFIO_IRQ_SET_ACTION_TRIGGER, fd, &err)) {
++                                       VFIO_IRQ_SET_ACTION_TRIGGER,
++                                       vfio_irq_signal_fd(&vdev->req_notifier),
++                                       &err)) {
+         error_reportf_err(err, VFIO_MSG_PREFIX, vdev->vbasedev.name);
+         qemu_set_fd_handler(fd, NULL, NULL, vdev);
+         vfio_notifier_cleanup(vdev, &vdev->req_notifier, "req_notifier", 0);
+@@ -3579,7 +3596,7 @@ static void vfio_pci_realize(PCIDevice *pdev, Error **errp)
+     char uuid[UUID_STR_LEN];
+     g_autofree char *name = NULL;
+ 
+-    if (vbasedev->fd < 0 && !vbasedev->sysfsdev) {
++    if (vbasedev->fd < 0 && !vbasedev->sysfsdev && !vbasedev->name) {
+         if (!(~vdev->host.domain || ~vdev->host.bus ||
+               ~vdev->host.slot || ~vdev->host.function)) {
+             error_setg(errp, "No provided host device");
+@@ -3652,8 +3669,10 @@ static void vfio_pci_realize(PCIDevice *pdev, Error **errp)
+         vfio_vga_quirk_setup(vdev);
+     }
+ 
+-    for (i = 0; i < PCI_ROM_SLOT; i++) {
+-        vfio_bar_quirk_setup(vdev, i);
++    if (!vdev->no_bar_quirks) {
++        for (i = 0; i < PCI_ROM_SLOT; i++) {
++            vfio_bar_quirk_setup(vdev, i);
++        }
+     }
+ 
+     if (!vfio_pci_interrupt_setup(vdev, errp)) {
+@@ -3785,7 +3804,8 @@ static void vfio_pci_reset(DeviceState *dev)
+ 
+     if (vdev->vbasedev.reset_works &&
+         (vdev->has_flr || !vdev->has_pm_reset) &&
+-        !ioctl(vdev->vbasedev.fd, VFIO_DEVICE_RESET)) {
++        vdev->vbasedev.io_ops && vdev->vbasedev.io_ops->device_reset &&
++        !vdev->vbasedev.io_ops->device_reset(&vdev->vbasedev)) {
+         trace_vfio_pci_reset_flr(vdev->vbasedev.name);
+         goto post_reset;
+     }
+@@ -3797,7 +3817,8 @@ static void vfio_pci_reset(DeviceState *dev)
+ 
+     /* If nothing else works and the device supports PM reset, use it */
+     if (vdev->vbasedev.reset_works && vdev->has_pm_reset &&
+-        !ioctl(vdev->vbasedev.fd, VFIO_DEVICE_RESET)) {
++        vdev->vbasedev.io_ops && vdev->vbasedev.io_ops->device_reset &&
++        !vdev->vbasedev.io_ops->device_reset(&vdev->vbasedev)) {
+         trace_vfio_pci_reset_pm(vdev->vbasedev.name);
+         goto post_reset;
+     }
+@@ -3953,6 +3974,9 @@ static void vfio_pci_class_init(ObjectClass *klass, const void *data)
+     object_class_property_add_str(klass, "fd", NULL, vfio_pci_set_fd);
+     dc->vmsd = &vfio_cpr_pci_vmstate;
+     dc->desc = "VFIO-based PCI device assignment";
++#ifdef CONFIG_DARWIN
++    dc->user_creatable = false;
++#endif
+     pdc->realize = vfio_pci_realize;
+ 
+     object_class_property_set_description(klass, /* 1.3 */
+diff --git a/hw/vfio/pci.h b/hw/vfio/pci.h
+index c9ab949870..2b4e53f699 100644
+--- a/hw/vfio/pci.h
++++ b/hw/vfio/pci.h
+@@ -187,6 +187,7 @@ struct VFIOPCIDevice {
+     bool defer_kvm_irq_routing;
+     bool clear_parent_atomics_on_exit;
+     bool skip_vsc_check;
++    bool no_bar_quirks;
+     uint16_t vpasid_cap_offset;
+     OnOffAuto ats;
+     VFIODisplay *dpy;
+diff --git a/hw/vfio/region.c b/hw/vfio/region.c
+index 54ad11a6c8..eb1c0385e0 100644
+--- a/hw/vfio/region.c
++++ b/hw/vfio/region.c
+@@ -273,15 +273,48 @@ int vfio_region_setup(Object *obj, VFIODevice *vbasedev, VFIORegion *region,
+     return 0;
+ }
+ 
+-static void vfio_subregion_unmap(VFIORegion *region, int index)
++void vfio_region_register_mmap(VFIORegion *region, int index)
+ {
++    char *name;
++
++    if (!region->mmaps[index].mmap) {
++        return;
++    }
++
++    name = g_strdup_printf("%s mmaps[%d]",
++                           memory_region_name(region->mem), index);
++    memory_region_init_ram_device_ptr(&region->mmaps[index].mem,
++                                      memory_region_owner(region->mem),
++                                      name, region->mmaps[index].size,
++                                      region->mmaps[index].mmap);
++    g_free(name);
++    memory_region_add_subregion(region->mem, region->mmaps[index].offset,
++                                &region->mmaps[index].mem);
++
++    trace_vfio_region_mmap(memory_region_name(&region->mmaps[index].mem),
++                           region->mmaps[index].offset,
++                           region->mmaps[index].offset +
++                           region->mmaps[index].size - 1);
++}
++
++void vfio_region_unregister_mmap(VFIORegion *region, int index)
++{
++    if (!region->mmaps[index].mmap) {
++        return;
++    }
++
+     trace_vfio_region_unmap(memory_region_name(&region->mmaps[index].mem),
+                             region->mmaps[index].offset,
+                             region->mmaps[index].offset +
+                             region->mmaps[index].size - 1);
+     memory_region_del_subregion(region->mem, &region->mmaps[index].mem);
+-    munmap(region->mmaps[index].mmap, region->mmaps[index].size);
+     object_unparent(OBJECT(&region->mmaps[index].mem));
++}
++
++static void vfio_region_unmap_fd_one(VFIORegion *region, int index)
++{
++    vfio_region_unregister_mmap(region, index);
++    munmap(region->mmaps[index].mmap, region->mmaps[index].size);
+     region->mmaps[index].mmap = NULL;
+ }
+ 
+@@ -346,14 +379,13 @@ static bool vfio_region_create_dma_buf(VFIORegion *region, Error **errp)
+     return true;
+ }
+ 
+-int vfio_region_mmap(VFIORegion *region)
++int vfio_region_mmap_fd(VFIORegion *region)
+ {
+     void *map_base, *map_align;
+     Error *local_err = NULL;
+     int i, ret, prot = 0;
+     off_t map_offset = 0;
+     size_t align;
+-    char *name;
+     int fd;
+ 
+     if (!region->mem || !region->nr_mmaps) {
+@@ -421,21 +453,7 @@ int vfio_region_mmap(VFIORegion *region)
+             goto no_mmap;
+         }
+ 
+-        name = g_strdup_printf("%s mmaps[%d]",
+-                               memory_region_name(region->mem), i);
+-        memory_region_init_ram_device_ptr(&region->mmaps[i].mem,
+-                                          memory_region_owner(region->mem),
+-                                          name, region->mmaps[i].size,
+-                                          region->mmaps[i].mmap);
+-        g_free(name);
+-        memory_region_add_subregion(region->mem, region->mmaps[i].offset,
+-                                    &region->mmaps[i].mem);
+-
+-        trace_vfio_region_mmap(memory_region_name(&region->mmaps[i].mem),
+-                               region->mmaps[i].offset,
+-                               region->mmaps[i].offset +
+-                               region->mmaps[i].size - 1);
+-
++        vfio_region_register_mmap(region, i);
+         map_offset = region->mmaps[i].offset + region->mmaps[i].size;
+     }
+ 
+@@ -461,13 +479,13 @@ no_mmap:
+     region->mmaps[i].mmap = NULL;
+ 
+     for (i--; i >= 0; i--) {
+-        vfio_subregion_unmap(region, i);
++        vfio_region_unmap_fd_one(region, i);
+     }
+ 
+     return ret;
+ }
+ 
+-void vfio_region_exit(VFIORegion *region)
++void vfio_region_unmap_fd(VFIORegion *region)
+ {
+     int i;
+ 
+@@ -477,27 +495,62 @@ void vfio_region_exit(VFIORegion *region)
+ 
+     for (i = 0; i < region->nr_mmaps; i++) {
+         if (region->mmaps[i].mmap) {
+-            memory_region_del_subregion(region->mem, &region->mmaps[i].mem);
++            vfio_region_unmap_fd_one(region, i);
+         }
+     }
++}
+ 
+-    trace_vfio_region_exit(region->vbasedev->name, region->nr);
++int vfio_region_mmap(VFIORegion *region)
++{
++    VFIODevice *vbasedev;
++
++    if (!region->mem) {
++        return 0;
++    }
++
++    vbasedev = region->vbasedev;
++    if (!vbasedev->io_ops || !vbasedev->io_ops->region_map) {
++        return -EINVAL;
++    }
++
++    return vbasedev->io_ops->region_map(vbasedev, region);
+ }
+ 
+-void vfio_region_finalize(VFIORegion *region)
++void vfio_region_unmap(VFIORegion *region)
+ {
+-    int i;
++    VFIODevice *vbasedev;
+ 
+     if (!region->mem) {
+         return;
+     }
+ 
+-    for (i = 0; i < region->nr_mmaps; i++) {
+-        if (region->mmaps[i].mmap) {
+-            munmap(region->mmaps[i].mmap, region->mmaps[i].size);
+-        }
++    vbasedev = region->vbasedev;
++    if (!vbasedev->io_ops || !vbasedev->io_ops->region_unmap) {
++        return;
++    }
++
++    vbasedev->io_ops->region_unmap(vbasedev, region);
++}
++
++void vfio_region_exit(VFIORegion *region)
++{
++    if (!region->mem) {
++        return;
++    }
++
++    vfio_region_unmap(region);
++
++    trace_vfio_region_exit(region->vbasedev->name, region->nr);
++}
++
++void vfio_region_finalize(VFIORegion *region)
++{
++    if (!region->mem) {
++        return;
+     }
+ 
++    vfio_region_unmap(region);
++
+     g_free(region->mem);
+     g_free(region->mmaps);
+ 
+diff --git a/hw/vfio/types.h b/hw/vfio/types.h
+index 5482d90808..b44c234ac4 100644
+--- a/hw/vfio/types.h
++++ b/hw/vfio/types.h
+@@ -20,4 +20,6 @@
+ 
+ #define TYPE_VFIO_PCI_NOHOTPLUG "vfio-pci-nohotplug"
+ 
++#define TYPE_VFIO_APPLE_PCI "vfio-apple-pci"
++
+ #endif /* HW_VFIO_VFIO_TYPES_H */
+diff --git a/hw/vfio/vfio-helpers.h b/hw/vfio/vfio-helpers.h
+index 54a327ffbc..2afb360797 100644
+--- a/hw/vfio/vfio-helpers.h
++++ b/hw/vfio/vfio-helpers.h
+@@ -9,7 +9,7 @@
+ #ifndef HW_VFIO_VFIO_HELPERS_H
+ #define HW_VFIO_VFIO_HELPERS_H
+ 
+-#ifdef CONFIG_LINUX
++#if defined(CONFIG_LINUX) || defined(CONFIG_DARWIN)
+ #include <linux/vfio.h>
+ 
+ extern int vfio_kvm_device_fd;
+diff --git a/hw/vfio/vfio-migration-internal.h b/hw/vfio/vfio-migration-internal.h
+index a1c58b1126..44410bfd25 100644
+--- a/hw/vfio/vfio-migration-internal.h
++++ b/hw/vfio/vfio-migration-internal.h
+@@ -9,7 +9,7 @@
+ #ifndef HW_VFIO_VFIO_MIGRATION_INTERNAL_H
+ #define HW_VFIO_VFIO_MIGRATION_INTERNAL_H
+ 
+-#ifdef CONFIG_LINUX
++#if defined(CONFIG_LINUX) || defined(CONFIG_DARWIN)
+ #include <linux/vfio.h>
+ #endif
+ 
+@@ -72,7 +72,7 @@ bool vfio_device_state_is_precopy(VFIODevice *vbasedev);
+ int vfio_save_device_config_state(QEMUFile *f, void *opaque, Error **errp);
+ int vfio_load_device_config_state(QEMUFile *f, void *opaque);
+ 
+-#ifdef CONFIG_LINUX
++#if defined(CONFIG_LINUX) || defined(CONFIG_DARWIN)
+ int vfio_migration_set_state(VFIODevice *vbasedev,
+                              enum vfio_device_mig_state new_state,
+                              enum vfio_device_mig_state recover_state,
+diff --git a/hw/vfio/vfio-region.h b/hw/vfio/vfio-region.h
+index 58b236f113..185b322126 100644
+--- a/hw/vfio/vfio-region.h
++++ b/hw/vfio/vfio-region.h
+@@ -39,6 +39,10 @@ uint64_t vfio_region_read(void *opaque,
+                           hwaddr addr, unsigned size);
+ int vfio_region_setup(Object *obj, VFIODevice *vbasedev, VFIORegion *region,
+                       int index, const char *name, Error **errp);
++void vfio_region_register_mmap(VFIORegion *region, int index);
++void vfio_region_unregister_mmap(VFIORegion *region, int index);
++int vfio_region_mmap_fd(VFIORegion *region);
++void vfio_region_unmap_fd(VFIORegion *region);
+ int vfio_region_mmap(VFIORegion *region);
+ void vfio_region_mmaps_set_enabled(VFIORegion *region, bool enabled);
+ void vfio_region_exit(VFIORegion *region);
+diff --git a/include/compat/linux/ioctl.h b/include/compat/linux/ioctl.h
+new file mode 100644
+index 0000000000..2c789fefc6
+--- /dev/null
++++ b/include/compat/linux/ioctl.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* empty Darwin shim - ioctl macros not needed */
+diff --git a/include/compat/linux/types.h b/include/compat/linux/types.h
+new file mode 100644
+index 0000000000..d6620aaf7f
+--- /dev/null
++++ b/include/compat/linux/types.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Darwin shim for <linux/types.h>
++ *
++ * The Linux UAPI headers that QEMU copies into linux-headers/ expect
++ * these typedefs from <linux/types.h>.  Provide the small subset we
++ * need so those headers parse on macOS.
++ */
++#ifndef COMPAT_LINUX_TYPES_H
++#define COMPAT_LINUX_TYPES_H
++
++#include <stdint.h>
++
++typedef uint8_t  __u8;
++typedef uint16_t __u16;
++typedef uint32_t __u32;
++typedef uint64_t __u64;
++typedef int8_t   __s8;
++typedef int16_t  __s16;
++typedef int32_t  __s32;
++typedef int64_t  __s64;
++typedef int64_t  loff_t;
++
++typedef __u64 __aligned_u64 __attribute__((aligned(8)));
++
++#endif /* COMPAT_LINUX_TYPES_H */
+diff --git a/include/hw/pci/pci.h b/include/hw/pci/pci.h
+index f2448e941a..a7fded4d1e 100644
+--- a/include/hw/pci/pci.h
++++ b/include/hw/pci/pci.h
+@@ -121,6 +121,7 @@ extern bool pci_available;
+ #define PCI_DEVICE_ID_REDHAT_ACPI_ERST   0x0012
+ #define PCI_DEVICE_ID_REDHAT_UFS         0x0013
+ #define PCI_DEVICE_ID_REDHAT_RISCV_IOMMU 0x0014
++#define PCI_DEVICE_ID_REDHAT_APPLE_DMA   0x0015
+ #define PCI_DEVICE_ID_REDHAT_QXL         0x0100
+ 
+ #define FMT_PCIBUS                      PRIx64
+diff --git a/include/hw/vfio/vfio-container.h b/include/hw/vfio/vfio-container.h
+index a15ee2df2b..355c72a4e7 100644
+--- a/include/hw/vfio/vfio-container.h
++++ b/include/hw/vfio/vfio-container.h
+@@ -117,6 +117,7 @@ vfio_container_get_page_size_mask(const VFIOContainer *bcontainer)
+ #define TYPE_VFIO_IOMMU_SPAPR TYPE_VFIO_IOMMU "-spapr"
+ #define TYPE_VFIO_IOMMU_IOMMUFD TYPE_VFIO_IOMMU "-iommufd"
+ #define TYPE_VFIO_IOMMU_USER TYPE_VFIO_IOMMU "-user"
++#define TYPE_VFIO_IOMMU_APPLE TYPE_VFIO_IOMMU "-apple"
+ 
+ struct VFIOIOMMUClass {
+     ObjectClass parent_class;
+diff --git a/include/hw/vfio/vfio-device.h b/include/hw/vfio/vfio-device.h
+index 8472420d3f..6619cca2c0 100644
+--- a/include/hw/vfio/vfio-device.h
++++ b/include/hw/vfio/vfio-device.h
+@@ -23,7 +23,7 @@
+ 
+ #include "system/memory.h"
+ #include "qemu/queue.h"
+-#ifdef CONFIG_LINUX
++#if defined(CONFIG_LINUX) || defined(CONFIG_DARWIN)
+ #include <linux/vfio.h>
+ #endif
+ #include "system/system.h"
+@@ -44,6 +44,7 @@ enum {
+ typedef struct VFIODeviceOps VFIODeviceOps;
+ typedef struct VFIODeviceIOOps VFIODeviceIOOps;
+ typedef struct VFIOMigration VFIOMigration;
++typedef struct VFIORegion VFIORegion;
+ 
+ typedef struct IOMMUFDBackend IOMMUFDBackend;
+ typedef struct VFIOIOASHwpt VFIOIOASHwpt;
+@@ -171,7 +172,7 @@ VFIODevice *vfio_get_vfio_device(Object *obj);
+ typedef QLIST_HEAD(VFIODeviceList, VFIODevice) VFIODeviceList;
+ extern VFIODeviceList vfio_device_list;
+ 
+-#ifdef CONFIG_LINUX
++#if defined(CONFIG_LINUX) || defined(CONFIG_DARWIN)
+ /*
+  * VFIO backend I/O operation capabilities
+  */
+@@ -273,6 +274,41 @@ struct VFIODeviceIOOps {
+      */
+     int (*region_write)(VFIODevice *vdev, uint8_t nr, off_t off, uint32_t size,
+                         void *data, bool post);
++
++    /**
++     * @device_reset
++     *
++     * Reset the device.
++     *
++     * @vdev: #VFIODevice to reset
++     *
++     * Returns 0 on success or -errno.
++     */
++    int (*device_reset)(VFIODevice *vdev);
++
++    /**
++     * @region_map
++     *
++     * Map a region's directly accessible subranges and register any mmap-backed
++     * subregions with QEMU.
++     *
++     * @vdev: #VFIODevice to use
++     * @region: #VFIORegion to map
++     *
++     * Returns 0 on success or -errno.
++     */
++    int (*region_map)(VFIODevice *vdev, VFIORegion *region);
++
++    /**
++     * @region_unmap
++     *
++     * Unregister any mmap-backed subregions for a region and release their
++     * backend mappings.
++     *
++     * @vdev: #VFIODevice to use
++     * @region: #VFIORegion to unmap
++     */
++    void (*region_unmap)(VFIODevice *vdev, VFIORegion *region);
+ };
+ 
+ void vfio_device_prepare(VFIODevice *vbasedev, VFIOContainer *bcontainer,
+diff --git a/include/system/darwin-activity.h b/include/system/darwin-activity.h
+new file mode 100644
+index 0000000000..de7cd691c1
+--- /dev/null
++++ b/include/system/darwin-activity.h
+@@ -0,0 +1,24 @@
++/*
++ * Darwin NSProcessInfo activity assertion helpers
++ *
++ * Keeps the process (and by extension its Darwin coalition) opted out of
++ * App Nap / background suppression while QEMU is running, so a GUI parent
++ * losing frontmost status does not demote our CPU QoS, timer coalescing,
++ * or disk I/O tier.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ */
++
++#ifndef QEMU_DARWIN_ACTIVITY_H
++#define QEMU_DARWIN_ACTIVITY_H
++
++#ifdef CONFIG_DARWIN
++void qemu_darwin_begin_vm_activity(const char *reason);
++void qemu_darwin_end_vm_activity(void);
++#else
++static inline void qemu_darwin_begin_vm_activity(const char *reason) { }
++static inline void qemu_darwin_end_vm_activity(void) { }
++#endif
++
++#endif /* QEMU_DARWIN_ACTIVITY_H */
+diff --git a/include/system/hvf_int.h b/include/system/hvf_int.h
+index a01691ce17..874f662cb5 100644
+--- a/include/system/hvf_int.h
++++ b/include/system/hvf_int.h
+@@ -20,6 +20,13 @@
+ #ifdef __aarch64__
+ #include <Hypervisor/Hypervisor.h>
+ typedef hv_vcpu_t hvf_vcpuid;
++/*
++ * ACTLR_EL1.EnTSO (Apple-private). Setting this bit on Apple silicon
++ * switches the vCPU to a total-store-ordering memory model; the
++ * sanctioned HVF API for it (HV_SYS_REG_ACTLR_EL1) only allows
++ * get/set of this single bit.
++ */
++#define ACTLR_EL1_TSO_ENABLE_MASK (1ULL << 1)
+ #else
+ #include <Hypervisor/hv.h>
+ typedef hv_vcpuid_t hvf_vcpuid;
+@@ -42,6 +49,17 @@ struct HVFState {
+     QTAILQ_HEAD(, hvf_sw_breakpoint) hvf_sw_breakpoints;
+ };
+ extern HVFState *hvf_state;
++#ifdef __aarch64__
++/*
++ * Set via the -accel hvf,tso=on accelerator property. When true, every
++ * vCPU has ACTLR_EL1.EnTSO set at vcpu-init time so the guest runs
++ * with x86-style total store ordering from its very first instruction.
++ * Doing this from QEMU is strictly safer than the in-guest "msr
++ * ACTLR_EL1" path because there are zero in-flight loads/stores when
++ * the bit is flipped.
++ */
++extern bool hvf_tso_mode;
++#endif
+ 
+ struct AccelCPUState {
+     hvf_vcpuid fd;
+diff --git a/iothread.c b/iothread.c
+index 3558535b40..f9b504100c 100644
+--- a/iothread.c
++++ b/iothread.c
+@@ -25,11 +25,43 @@
+ #include "qemu/rcu.h"
+ #include "qemu/main-loop.h"
+ 
++#ifdef CONFIG_DARWIN
++#include <sys/resource.h>
++#endif
++
++#ifdef CONFIG_POSIX
++/* Benchmark results from 2016 on NVMe SSD drives show max polling times around
++ * 16-32 microseconds yield IOPS improvements for both iodepth=1 and iodepth=32
++ * workloads.
++ */
++#define IOTHREAD_POLL_MAX_NS_DEFAULT 32768ULL
++#else
++#define IOTHREAD_POLL_MAX_NS_DEFAULT 0ULL
++#endif
++
+ static void *iothread_run(void *opaque)
+ {
+     IOThread *iothread = opaque;
+ 
+     rcu_register_thread();
++
++#ifdef CONFIG_DARWIN
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    {
++        struct sched_param param;
++        param.sched_priority = sched_get_priority_max(SCHED_RR);
++        pthread_setschedparam(pthread_self(), SCHED_RR, &param);
++    }
++    /*
++     * Mark this thread as high-priority for disk I/O so the kernel won't
++     * demote it to a throttled tier when the hosting GUI app goes into the
++     * background (coalition-level backgrounding otherwise treats our default
++     * IOPOL_STANDARD as throttleable under contention).
++     */
++    setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_IMPORTANT);
++    setiopolicy_np(IOPOL_TYPE_VFS_ATIME_UPDATES, IOPOL_SCOPE_THREAD,
++                   IOPOL_ATIME_UPDATES_OFF);
++#endif
+     /*
+      * g_main_context_push_thread_default() must be called before anything
+      * in this new thread uses glib.
+diff --git a/meson.build b/meson.build
+index d9f073332c..3de54d192d 100644
+--- a/meson.build
++++ b/meson.build
+@@ -786,7 +786,14 @@ if 'objc' in all_languages
+   add_project_arguments(objc.get_supported_arguments(qemu_common_flags + warn_flags),
+                         native: false, language: 'objc')
+ endif
+-if host_os == 'linux'
++if host_os == 'darwin'
++  # linux-headers/linux/vfio.h includes <linux/types.h> and <linux/ioctl.h>
++  # which are system headers on Linux but absent on macOS.  Point at the
++  # static shims in include/compat/
++  add_project_arguments('-isystem', meson.current_source_dir() / 'include/compat',
++                        language: all_languages)
++endif
++if host_os in ['linux', 'darwin']
+   add_project_arguments('-isystem', meson.current_source_dir() / 'linux-headers',
+                         '-isystem', 'linux-headers',
+                         language: all_languages)
+@@ -852,6 +859,7 @@ if host_os == 'windows'
+   host_dsosuf = '.dll'
+ elif host_os == 'darwin'
+   coref = dependency('appleframeworks', modules: 'CoreFoundation')
++  foundation = dependency('appleframeworks', modules: 'Foundation')
+   iokit = dependency('appleframeworks', modules: 'IOKit', required: false)
+   host_dsosuf = '.dylib'
+   pvg = dependency('appleframeworks', modules: ['ParavirtualizedGraphics', 'Metal'],
+@@ -3277,6 +3285,7 @@ host_kconfig = \
+   (have_vhost_kernel ? ['CONFIG_VHOST_KERNEL=y'] : []) + \
+   (have_virtfs ? ['CONFIG_VIRTFS=y'] : []) + \
+   (host_os == 'linux' ? ['CONFIG_LINUX=y'] : []) + \
++  (host_os == 'darwin' ? ['CONFIG_DARWIN=y'] : []) + \
+   (multiprocess_allowed ? ['CONFIG_MULTIPROCESS_ALLOWED=y'] : []) + \
+   (vfio_user_server_allowed ? ['CONFIG_VFIO_USER_SERVER_ALLOWED=y'] : []) + \
+   (hv_balloon ? ['CONFIG_HV_BALLOON_POSSIBLE=y'] : []) + \
+diff --git a/system/darwin-activity.m b/system/darwin-activity.m
+new file mode 100644
+index 0000000000..6ed6980fdc
+--- /dev/null
++++ b/system/darwin-activity.m
+@@ -0,0 +1,65 @@
++/*
++ * Darwin NSProcessInfo activity assertion helpers
++ *
++ * Copyright (c) 2024 QEMU authors
++ *
++ * Holds an NSProcessInfo activity token for the lifetime of the QEMU
++ * process. The token opts this process (and by coalition aggregation any
++ * children we spawn or parents that spawned us) out of App Nap and
++ * background-state suppression, which on Darwin would otherwise demote
++ * CPU QoS, timer coalescing, and disk I/O tier when the hosting GUI app
++ * loses frontmost status.
++ *
++ * This complements the per-thread / process-scope setiopolicy_np calls
++ * in iothread.c, util/thread-pool.c, and system/main.c: those pin our
++ * disk I/O tier to IOPOL_IMPORTANT, this keeps the kernel from deciding
++ * we're eligible for background suppression in the first place.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ * See the COPYING file in the top-level directory.
++ */
++
++#include "qemu/osdep.h"
++#include "system/darwin-activity.h"
++
++#import <Foundation/Foundation.h>
++
++/*
++ * The NSProcessInfo token is an opaque id that must be kept alive for the
++ * duration of the activity. QEMU builds ObjC sources without ARC (see
++ * ui/cocoa.m), so we retain the token explicitly.
++ */
++static id qemu_darwin_activity_token;
++
++void qemu_darwin_begin_vm_activity(const char *reason)
++{
++    if (qemu_darwin_activity_token) {
++        return;
++    }
++
++    @autoreleasepool {
++        NSString *ns_reason = reason
++            ? [NSString stringWithUTF8String:reason]
++            : @"QEMU running guest VM";
++
++        NSActivityOptions opts = NSActivityUserInitiated
++                               | NSActivityLatencyCritical
++                               | NSActivityIdleSystemSleepDisabled;
++
++        id token = [[NSProcessInfo processInfo]
++                       beginActivityWithOptions:opts
++                                         reason:ns_reason];
++        qemu_darwin_activity_token = [token retain];
++    }
++}
++
++void qemu_darwin_end_vm_activity(void)
++{
++    if (!qemu_darwin_activity_token) {
++        return;
++    }
++
++    [[NSProcessInfo processInfo] endActivity:qemu_darwin_activity_token];
++    [qemu_darwin_activity_token release];
++    qemu_darwin_activity_token = nil;
++}
+diff --git a/system/main.c b/system/main.c
+index b8f7157cc3..46d304c3b0 100644
+--- a/system/main.c
++++ b/system/main.c
+@@ -25,6 +25,7 @@
+ #include "qemu/osdep.h"
+ #include "qemu-main.h"
+ #include "qemu/main-loop.h"
++#include "system/darwin-activity.h"
+ #include "system/replay.h"
+ #include "system/system.h"
+ 
+@@ -39,12 +40,25 @@
+ 
+ #ifdef CONFIG_DARWIN
+ #include <CoreFoundation/CoreFoundation.h>
++#include <sys/resource.h>
+ #endif
+ 
+ static void *qemu_default_main(void *opaque)
+ {
+     int status;
+ 
++#ifdef CONFIG_DARWIN
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    {
++        struct sched_param param;
++        param.sched_priority = sched_get_priority_max(SCHED_RR);
++        pthread_setschedparam(pthread_self(), SCHED_RR, &param);
++    }
++    setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_IMPORTANT);
++    setiopolicy_np(IOPOL_TYPE_VFS_ATIME_UPDATES, IOPOL_SCOPE_THREAD,
++                   IOPOL_ATIME_UPDATES_OFF);
++#endif
++
+     replay_mutex_lock();
+     bql_lock();
+     status = qemu_main_loop();
+@@ -52,6 +66,8 @@ static void *qemu_default_main(void *opaque)
+     bql_unlock();
+     replay_mutex_unlock();
+ 
++    qemu_darwin_end_vm_activity();
++
+     exit(status);
+ }
+ 
+@@ -68,6 +84,31 @@ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
+ 
+ int main(int argc, char **argv)
+ {
++#ifdef CONFIG_DARWIN
++    /*
++     * Raise the default disk I/O tier for the whole process before any
++     * thread is spawned. Threads we explicitly tune (iothread, aio worker
++     * pool, this main thread) set IOPOL_SCOPE_THREAD individually, but this
++     * process-scope default covers everything else (QMP monitor, VNC, char
++     * device helpers, migration, etc.) and any future threads we forget
++     * about. Without it, coalition-level backgrounding (e.g. when the
++     * hosting GUI app is not frontmost) demotes our default-STANDARD I/O
++     * into the kernel's throttled tier under contention.
++     */
++    setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_IMPORTANT);
++    setiopolicy_np(IOPOL_TYPE_VFS_ATIME_UPDATES, IOPOL_SCOPE_PROCESS,
++                   IOPOL_ATIME_UPDATES_OFF);
++#endif
++
++    /*
++     * Hold an NSProcessInfo activity assertion for the lifetime of the
++     * process. Coalition-level backgrounding (triggered when a parent GUI
++     * app loses frontmost status) otherwise demotes our scheduler QoS and
++     * I/O tier for the whole process tree; this keeps us marked
++     * user-initiated / latency-critical regardless of who launched us.
++     */
++    qemu_darwin_begin_vm_activity("QEMU running guest VM");
++
+     qemu_init(argc, argv);
+ 
+     /*
+diff --git a/system/meson.build b/system/meson.build
+index cd3193d170..b77793815a 100644
+--- a/system/meson.build
++++ b/system/meson.build
+@@ -39,3 +39,6 @@ system_ss.add(when: 'CONFIG_DEVICE_TREE',
+ if host_os == 'linux'
+   system_ss.add(files('async-teardown.c'))
+ endif
++if host_os == 'darwin'
++  system_ss.add(files('darwin-activity.m'), foundation)
++endif
+diff --git a/util/event_notifier-posix.c b/util/event_notifier-posix.c
+index 83fdbb96bb..0e05e81aca 100644
+--- a/util/event_notifier-posix.c
++++ b/util/event_notifier-posix.c
+@@ -20,10 +20,10 @@
+ #include <sys/eventfd.h>
+ #endif
+ 
+-#ifdef CONFIG_EVENTFD
+ /*
+  * Initialize @e with existing file descriptor @fd.
+- * @fd must be a genuine eventfd object, emulation with pipe won't do.
++ * On hosts without eventfd(), callers can still restore a single descriptor
++ * for cases that only need eventfd-like semantics.
+  */
+ void event_notifier_init_fd(EventNotifier *e, int fd)
+ {
+@@ -31,7 +31,6 @@ void event_notifier_init_fd(EventNotifier *e, int fd)
+     e->wfd = fd;
+     e->initialized = true;
+ }
+-#endif
+ 
+ int event_notifier_init(EventNotifier *e, int active)
+ {
+diff --git a/util/thread-pool.c b/util/thread-pool.c
+index 4e75191c98..7c70590fd4 100644
+--- a/util/thread-pool.c
++++ b/util/thread-pool.c
+@@ -24,6 +24,10 @@
+ #include "block/thread-pool.h"
+ #include "qemu/main-loop.h"
+ 
++#ifdef CONFIG_DARWIN
++#include <sys/resource.h>
++#endif
++
+ static void do_spawn_thread(ThreadPoolAio *pool);
+ 
+ typedef struct ThreadPoolElementAio ThreadPoolElementAio;
+@@ -83,6 +87,21 @@ static void *worker_thread(void *opaque)
+ {
+     ThreadPoolAio *pool = opaque;
+ 
++#ifdef CONFIG_DARWIN
++    /*
++     * Block-layer aio worker threads are the ones actually issuing
++     * pread/pwrite/fsync for file-backed disks on Darwin (no linux-aio or
++     * io_uring here). Give them a scheduler hint and, more importantly, an
++     * elevated disk I/O tier so coalition-level backgrounding (e.g. the
++     * hosting GUI app losing frontmost status) does not push their I/O into
++     * the throttled tier.
++     */
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
++    setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_IMPORTANT);
++    setiopolicy_np(IOPOL_TYPE_VFS_ATIME_UPDATES, IOPOL_SCOPE_THREAD,
++                   IOPOL_ATIME_UPDATES_OFF);
++#endif
++
+     qemu_mutex_lock(&pool->lock);
+     pool->pending_threads--;
+     do_spawn_thread(pool);

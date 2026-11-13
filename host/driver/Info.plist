@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Venus GPU Driver</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>VFIOUserPCIDriver</key>
+		<dict>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xff000000</string>
+			<key>IOPCITunnelCompatible</key>
+			<true/>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>IOPCITunnelled</key>
+				<true/>
+			</dict>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOUserClass</key>
+			<string>VFIOUserPCIDriver</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>VFIOUserPCIDriverUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>VFIOUserPCIDriverUserClient</string>
+			</dict>
+		</dict>
+	</dict>
+	<key>OSBundleUsageDescription</key>
+	<string>VFIO User PCI Driver</string>
+</dict>
+</plist>

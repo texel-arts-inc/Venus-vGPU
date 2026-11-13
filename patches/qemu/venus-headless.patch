@@ -1,0 +1,20 @@
+diff --git a/configs/devices/aarch64-softmmu/default.mak b/configs/devices/aarch64-softmmu/default.mak
+--- a/configs/devices/aarch64-softmmu/default.mak
++++ b/configs/devices/aarch64-softmmu/default.mak
+@@ -8,4 +8,4 @@
+ # CONFIG_XLNX_VERSAL=n
+ # CONFIG_SBSA_REF=n
+ # CONFIG_NPCM8XX=n
+-CONFIG_VMAPPLE=y
++CONFIG_VMAPPLE=n
+diff --git a/hw/vfio/region.c b/hw/vfio/region.c
+--- a/hw/vfio/region.c
++++ b/hw/vfio/region.c
+@@ -516,6 +516,6 @@
+     return vbasedev->io_ops->region_map(vbasedev, region);
+ }
+ 
+-void vfio_region_unmap(VFIORegion *region)
++static void vfio_region_unmap(VFIORegion *region)
+ {
+     VFIODevice *vbasedev;

@@ -1,0 +1,92 @@
+--- a/meson.build
++++ b/meson.build
+@@ -3268,7 +3268,7 @@
+   'loongarch' : ['CONFIG_LOONGARCH_DIS'],
+ }
+ 
+-have_ivshmem = config_host_data.get('CONFIG_EVENTFD')
++have_ivshmem = config_host_data.get('CONFIG_EVENTFD') or host_os == 'darwin'
+ host_kconfig = \
+   (get_option('fuzzing') ? ['CONFIG_FUZZ=y'] : []) + \
+   (have_tpm ? ['CONFIG_TPM=y'] : []) + \
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -79,7 +79,7 @@
+ config IVSHMEM_DEVICE
+     bool
+     default y if PCI_DEVICES
+-    depends on PCI && LINUX && IVSHMEM && MSI_NONBROKEN
++    depends on PCI && (LINUX || DARWIN) && IVSHMEM && MSI_NONBROKEN
+ 
+ config IVSHMEM_FLAT_DEVICE
+     bool
+--- a/hw/misc/ivshmem-pci.c
++++ b/hw/misc/ivshmem-pci.c
+@@ -45,6 +45,11 @@
+ 
+ #define IVSHMEM_MAX_PEERS UINT16_MAX
+ #define IVSHMEM_IOEVENTFD   0
++#ifdef CONFIG_DARWIN
++#define CONFIG_IVSHMEM_IOEVENTFD_DEFAULT false
++#else
++#define CONFIG_IVSHMEM_IOEVENTFD_DEFAULT true
++#endif
+ #define IVSHMEM_MSI     1
+ 
+ #define IVSHMEM_REG_BAR_SIZE 0x100
+@@ -1104,7 +1109,7 @@
+     DEFINE_PROP_CHR("chardev", IVShmemState, server_chr),
+     DEFINE_PROP_UINT32("vectors", IVShmemState, vectors, 1),
+     DEFINE_PROP_BIT("ioeventfd", IVShmemState, features, IVSHMEM_IOEVENTFD,
+-                    true),
++                    CONFIG_IVSHMEM_IOEVENTFD_DEFAULT),
+     DEFINE_PROP_ON_OFF_AUTO("master", IVShmemState, master, ON_OFF_AUTO_OFF),
+ };
+ 
+--- a/contrib/ivshmem-server/ivshmem-server.c
++++ b/contrib/ivshmem-server/ivshmem-server.c
+@@ -127,6 +127,35 @@
+     return 0;
+ }
+ 
++/*
++ * Darwin passes a nonblocking, read/write FIFO descriptor in the same
++ * protocol slot as Linux eventfd. Unlink it before passing it to peers.
++ */
++static int ivshmem_vector_init(EventNotifier *vector)
++{
++#ifdef __APPLE__
++    char directory[] = "/tmp/ivshmem-vector.XXXXXX";
++    int fd = -1;
++
++    if (!mkdtemp(directory)) {
++        return -errno;
++    }
++    g_autofree char *path = g_build_filename(directory, "notify", NULL);
++    if (mkfifo(path, 0600) == 0) {
++        fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
++        unlink(path);
++    }
++    rmdir(directory);
++    if (fd < 0) {
++        return -1;
++    }
++    event_notifier_init_fd(vector, fd);
++    return 0;
++#else
++    return event_notifier_init(vector, false);
++#endif
++}
++
+ /* handle message on listening unix socket (new client connection) */
+ static int
+ ivshmem_server_handle_new_conn(IvshmemServer *server)
+@@ -180,7 +209,7 @@
+     /* create eventfd, one per vector */
+     peer->vectors_count = server->n_vectors;
+     for (i = 0; i < peer->vectors_count; i++) {
+-        if (event_notifier_init(&peer->vectors[i], FALSE) < 0) {
++        if (ivshmem_vector_init(&peer->vectors[i]) < 0) {
+             IVSHMEM_SERVER_DEBUG(server, "cannot create eventfd\n");
+             goto fail;
+         }

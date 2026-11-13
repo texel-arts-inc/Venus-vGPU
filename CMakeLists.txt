@@ -7,3 +7,13 @@ include(cmake/FindExecutable.cmake)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR "Use an out-of-source build, for example cmake -S . -B build.")
 endif()
+
+option(VENUS_BUILD_HOST "Enable the macOS host app, runtime and packaging targets" ${APPLE})
+
+if(VENUS_BUILD_HOST)
+    if(NOT APPLE)
+        message(FATAL_ERROR "VENUS_BUILD_HOST requires macOS.")
+    endif()
+    include(cmake/VenusFramework.cmake)
+    add_subdirectory(host)
+endif()

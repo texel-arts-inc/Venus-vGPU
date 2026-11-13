@@ -1,0 +1,388 @@
+--- a/hw/vfio/apple-device.c
++++ b/hw/vfio/apple-device.c
+@@ -15,6 +15,7 @@
+ #include <linux/vfio.h>
+ 
+ #include "apple-dext-client.h"
++#include "apple-vfio-pm-controller.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/vfio/apple.h"
+ #include "hw/vfio/vfio-container.h"
+@@ -23,6 +24,7 @@
+ #include "qemu/host-pci-mmio.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/units.h"
++#include "system/runstate.h"
+ 
+ typedef struct AppleVFIOSharedDext {
+     io_connect_t conn;
+@@ -191,7 +193,7 @@
+         return;
+     }
+ 
+-    if (conn == IO_OBJECT_NULL) {
++    if (apple->pm_gated || conn == IO_OBJECT_NULL) {
+         return;
+     }
+ 
+@@ -397,8 +399,12 @@
+ 
+ static int apple_vfio_device_reset(VFIODevice *vbasedev)
+ {
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
+     io_connect_t conn = apple_vfio_connection(vbasedev);
+ 
++    if (adev->apple && adev->apple->pm_gated) {
++        return -EBUSY;
++    }
+     if (conn == IO_OBJECT_NULL) {
+         return -ENODEV;
+     }
+@@ -491,7 +497,7 @@
+     uint64_t mask[4] = {0};
+     uint32_t i;
+ 
+-    if (conn == IO_OBJECT_NULL) {
++    if (conn == IO_OBJECT_NULL || (adev->apple && adev->apple->pm_gated)) {
+         return;
+     }
+ 
+@@ -548,10 +554,14 @@
+ static int apple_vfio_region_read(VFIODevice *vbasedev, uint8_t nr, off_t off,
+                                   uint32_t size, void *data)
+ {
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
+     io_connect_t conn = apple_vfio_connection(vbasedev);
+     kern_return_t kr;
+     uint32_t legacy_size = 0;
+ 
++    if (adev->apple && adev->apple->pm_gated) {
++        return -EBUSY;
++    }
+     if (nr != VFIO_PCI_CONFIG_REGION_INDEX) {
+         return apple_vfio_bar_read(vbasedev, nr, off, size, data);
+     }
+@@ -697,11 +707,15 @@
+ static int apple_vfio_region_write(VFIODevice *vbasedev, uint8_t nr, off_t off,
+                                    uint32_t size, void *data, bool post)
+ {
++    VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
+     io_connect_t conn = apple_vfio_connection(vbasedev);
+     uint64_t value = 0;
+     kern_return_t kr;
+     uint32_t legacy_size;
+ 
++    if (adev->apple && adev->apple->pm_gated) {
++        return -EBUSY;
++    }
+     if (nr != VFIO_PCI_CONFIG_REGION_INDEX) {
+         return apple_vfio_bar_write(vbasedev, nr, off, size, data);
+     }
+@@ -742,7 +756,146 @@
+ 
+ static int apple_vfio_region_map(VFIODevice *vbasedev, VFIORegion *region);
+ static void apple_vfio_region_unmap(VFIODevice *vbasedev, VFIORegion *region);
++
++static bool apple_vfio_pm_read_pci(VFIOApplePCIDevice *adev, bool compare,
++                                  Error **errp)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    AppleVFIOState *apple = adev->apple;
++    io_connect_t conn = apple_vfio_connection(&vdev->vbasedev);
++    uint64_t identity;
++
++    if (conn == IO_OBJECT_NULL ||
++        apple_dext_config_read(conn, PCI_VENDOR_ID, 4, &identity) != KERN_SUCCESS ||
++        (identity & UINT16_MAX) == UINT16_MAX ||
++        (compare && identity != apple->pm_identity)) {
++        error_setg(errp, "vfio-apple: physical PCI function is unavailable or changed");
++        return false;
++    }
++    apple->pm_identity = identity;
++
++    for (int i = 0; i < PCI_ROM_SLOT; i++) {
++        AppleVFIOSleepBAR *saved = &apple->pm_bars[i];
++        AppleVFIOSleepBAR live = { .mapped = apple->bar_maps[i].addr != NULL };
++        uint64_t config;
++
++        if (apple_dext_config_read(conn, PCI_BASE_ADDRESS_0 + 4 * i, 4,
++                                   &config) != KERN_SUCCESS ||
++            (compare && config != apple->pm_bar_config[i])) {
++            error_setg(errp, "vfio-apple: physical BAR%d config changed", i);
++            return false;
++        }
++        apple->pm_bar_config[i] = config;
++        if (live.mapped && !apple_vfio_get_bar_info(adev, i, &live.memory_index,
++                                                   &live.size, &live.type)) {
++            error_setg(errp, "vfio-apple: could not validate BAR%d", i);
++            return false;
++        }
++        if (compare) {
++            if (saved->mapped != live.mapped || saved->size != live.size ||
++                saved->memory_index != live.memory_index || saved->type != live.type) {
++                error_setg(errp, "vfio-apple: DriverKit BAR%d mapping changed", i);
++                return false;
++            }
++        } else {
++            live.enabled = vdev->bars[i].mr && vdev->bars[i].mr->enabled;
++            *saved = live;
++        }
++    }
++    return true;
++}
+ 
++static bool apple_vfio_pm_read_dma(VFIOApplePCIDevice *adev, bool verify,
++                                  uint64_t state[4], Error **errp)
++{
++    io_connect_t conn = apple_vfio_connection(&VFIO_PCI_DEVICE(adev)->vbasedev);
++    kern_return_t result = conn == IO_OBJECT_NULL ? kIOReturnNotAttached :
++                          apple_dext_dma_checkpoint(conn, verify, state);
++
++    if (result != KERN_SUCCESS) {
++        error_setg(errp, "vfio-apple: DriverKit DMA checkpoint failed (%#x)", result);
++        return false;
++    }
++    return true;
++}
++
++static bool apple_vfio_pm_verify_dma(VFIOApplePCIDevice *adev, Error **errp)
++{
++    uint64_t state[4];
++
++    if (!apple_vfio_pm_read_dma(adev, true, state, errp)) {
++        return false;
++    }
++    if (memcmp(state, adev->apple->pm_dma_state, sizeof(state))) {
++        error_setg(errp, "vfio-apple: prepared DMA mapping inventory changed during sleep");
++        return false;
++    }
++    return true;
++}
++
++void apple_vfio_pm_emergency_gate(VFIOApplePCIDevice *adev)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    AppleVFIOState *apple = adev->apple;
++
++    if (!apple || apple->pm_gated) {
++        return;
++    }
++    apple->pm_gated = true;
++    memory_region_transaction_begin();
++    for (int i = 0; i < PCI_ROM_SLOT; i++) {
++        if (vdev->bars[i].mr) {
++            memory_region_set_enabled(vdev->bars[i].mr, false);
++        }
++    }
++    memory_region_transaction_commit();
++}
++
++bool apple_vfio_pm_gate(VFIOApplePCIDevice *adev, Error **errp)
++{
++    AppleVFIOState *apple = adev->apple;
++
++    if (!apple || !adev->parent_obj.vbasedev.bcontainer ||
++        !runstate_check(RUN_STATE_PAUSED) || apple->pm_gated) {
++        error_setg(errp, "vfio-apple: PM gate requires an attached device and paused VM");
++        return false;
++    }
++    if (!apple_vfio_pm_read_pci(adev, false, errp) ||
++        !apple_vfio_pm_read_dma(adev, false, apple->pm_dma_state, errp)) {
++        return false;
++    }
++    apple_vfio_pm_emergency_gate(adev);
++    return true;
++}
++
++bool apple_vfio_pm_validate_pci(VFIOApplePCIDevice *adev, Error **errp)
++{
++    if (!adev->apple || !adev->parent_obj.vbasedev.bcontainer ||
++        !runstate_check(RUN_STATE_PAUSED) || !adev->apple->pm_gated) {
++        error_setg(errp, "vfio-apple: PM validation requires a gated, paused device");
++        return false;
++    }
++    return apple_vfio_pm_read_pci(adev, true, errp);
++}
++
++void apple_vfio_pm_enable_after_dma_check(VFIOApplePCIDevice *adev)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(adev);
++    AppleVFIOState *apple = adev->apple;
++
++    assert(apple && apple->pm_gated && runstate_check(RUN_STATE_PAUSED));
++    memory_region_transaction_begin();
++    for (int i = 0; i < PCI_ROM_SLOT; i++) {
++        if (apple->pm_bars[i].enabled) {
++            memory_region_set_enabled(vdev->bars[i].mr, true);
++        }
++    }
++    memory_region_transaction_commit();
++    apple->pm_gated = false;
++    apple_vfio_update_irq_mask(&vdev->vbasedev);
++    event_notifier_set(&apple->irq_notifier);
++}
++
+ static int apple_vfio_region_map(VFIODevice *vbasedev, VFIORegion *region)
+ {
+     VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(vbasedev->dev);
+@@ -1050,6 +1203,7 @@
+ 
+ static void (*parent_realize)(PCIDevice *, Error **);
+ static void (*parent_exit)(PCIDevice *);
++static void apple_vfio_pci_exit_fn(PCIDevice *pdev);
+ 
+ static void apple_vfio_pci_instance_init(Object *obj)
+ {
+@@ -1063,6 +1217,10 @@
+     ERRP_GUARD();
+     VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(pdev);
+ 
++    if (!!adev->pm_socket != !!adev->pm_chardev) {
++        error_setg(errp, "vfio-apple: configure both venus-pm-socket and venus-pm-chardev");
++        return;
++    }
+     if (!apple_vfio_pci_pre_realize(adev, errp)) {
+         return;
+     }
+@@ -1090,12 +1248,25 @@
+             return;
+         }
+     }
++    if (adev->pm_socket) {
++        uint64_t state[4];
++
++        if (apple_vfio_pm_read_dma(adev, false, state, errp)) {
++            adev->pm = apple_vfio_pm_start(adev, adev->pm_socket, adev->pm_chardev,
++                                          apple_vfio_pm_verify_dma, errp);
++        }
++        if (!adev->pm) {
++            apple_vfio_pci_exit_fn(pdev);
++            g_clear_pointer(&adev->apple, g_free);
++        }
++    }
+ }
+ 
+ static void apple_vfio_pci_exit_fn(PCIDevice *pdev)
+ {
+     VFIOApplePCIDevice *adev = VFIO_APPLE_PCI(pdev);
+ 
++    g_clear_pointer(&adev->pm, apple_vfio_pm_stop);
+     apple_vfio_teardown_bounce_buffer(adev);
+     apple_vfio_destroy_dma_companion(adev);
+ 
+@@ -1113,6 +1284,8 @@
+ }
+ 
+ static const Property apple_vfio_pci_properties[] = {
++    DEFINE_PROP_STRING("venus-pm-socket", VFIOApplePCIDevice, pm_socket),
++    DEFINE_PROP_STRING("venus-pm-chardev", VFIOApplePCIDevice, pm_chardev),
+     DEFINE_PROP_BOOL("dma-companion", VFIOApplePCIDevice,
+                      use_dma_companion, false),
+     DEFINE_PROP_SIZE("dma-bounce-size", VFIOApplePCIDevice,
+--- a/hw/vfio/apple.h
++++ b/hw/vfio/apple.h
+@@ -47,11 +47,24 @@
+     size_t size;
+ } AppleVFIOBarMap;
+ 
++typedef struct AppleVFIOSleepBAR {
++    uint64_t size;
++    uint8_t memory_index;
++    uint8_t type;
++    bool mapped;
++    bool enabled;
++} AppleVFIOSleepBAR;
++
+ typedef struct AppleVFIOState {
+     AppleDextInterruptNotify *irq_notify;
+     EventNotifier irq_notifier;
+     uint32_t num_irq_vectors;
+     AppleVFIOBarMap bar_maps[PCI_ROM_SLOT];
++    bool pm_gated;
++    uint64_t pm_identity;
++    uint64_t pm_dma_state[4];
++    uint64_t pm_bar_config[PCI_ROM_SLOT];
++    AppleVFIOSleepBAR pm_bars[PCI_ROM_SLOT];
+ } AppleVFIOState;
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(VFIOApplePCIDevice, VFIO_APPLE_PCI)
+@@ -76,6 +89,9 @@
+     bool use_dma_companion;
+     uint64_t dma_bounce_size;
+     VFIOAppleBounceBuffer *bounce;
++    struct AppleVFIOPM *pm;
++    char *pm_socket;
++    char *pm_chardev;
+     /*
+      * Optional `host-root=` property: the registry-entry name of the
+      * topmost IOPCIDevice ancestor for the dext instance to bind to
+@@ -92,6 +108,13 @@
+ bool apple_vfio_get_bar_info(VFIOApplePCIDevice *adev, uint8_t bar,
+                              uint8_t *mem_idx, uint64_t *size,
+                              uint8_t *type);
++/* Main loop only, with the BQL held and guest vCPUs already stopped. */
++bool apple_vfio_pm_gate(VFIOApplePCIDevice *adev, Error **errp);
++bool apple_vfio_pm_validate_pci(VFIOApplePCIDevice *adev, Error **errp);
++/* Fail closed without touching PCI configuration space. */
++void apple_vfio_pm_emergency_gate(VFIOApplePCIDevice *adev);
++/* The coordinator must independently prove that live DMA mappings survived. */
++void apple_vfio_pm_enable_after_dma_check(VFIOApplePCIDevice *adev);
+ 
+ /*
+  * Shared dext-connection cache: a single io_connect_t is opened by the
+--- a/hw/vfio/apple-dext-client.c
++++ b/hw/vfio/apple-dext-client.c
+@@ -37,6 +37,7 @@
+     kSelectorWaitInterrupt      = 15,
+     kSelectorSetIRQMask         = 16,
+     kSelectorResetDevice        = 17,
++    kSelectorDMACheckpoint      = 18,
+ };
+ 
+ /*
+@@ -490,6 +491,18 @@
+ }
+ 
+ kern_return_t
++apple_dext_dma_checkpoint(io_connect_t connection, bool verify, uint64_t state[4])
++{
++    uint64_t input = verify;
++    uint32_t count = 4;
++    kern_return_t result = IOConnectCallMethod(connection, kSelectorDMACheckpoint,
++                                               &input, 1, NULL, 0, state, &count,
++                                               NULL, NULL);
++
++    return result == KERN_SUCCESS && count != 4 ? kIOReturnBadArgument : result;
++}
++
++kern_return_t
+ apple_dext_probe_dma(io_connect_t connection,
+                          uint64_t iova,
+                          uint64_t offset,
+--- a/hw/vfio/apple-dext-client.h
++++ b/hw/vfio/apple-dext-client.h
+@@ -22,6 +22,10 @@
+ 
+ #include <IOKit/IOKitLib.h>
+ #include <stdint.h>
++#include <stdbool.h>
++
++kern_return_t apple_dext_dma_checkpoint(io_connect_t connection, bool verify,
++                                        uint64_t state[4]);
+ 
+ /*
+  * Find the VFIOUserPCIDriver dext instance matching the given PCI BDF
+--- a/hw/vfio/meson.build
++++ b/hw/vfio/meson.build
+@@ -46,7 +46,10 @@
+ if host_os == 'darwin'
+   system_ss.add(when: 'CONFIG_VFIO',
+                 if_true: [files('apple-device.c', 'apple-dma.c',
+-                                'container-apple.c', 'apple-dext-client.c'),
++                                'container-apple.c', 'apple-dext-client.c',
++                                'darwin-power.c', 'venus-pm-host.c',
++                                'apple-vfio-pm-controller.c', 'venus-pm-controller.c',
++                                'venus-pm-transition.c', 'venus-pm-wire.c'),
+                           coref, iokit])
+   # FDT helper lives in specific_ss because libfdt is only linked into
+   # targets that set CONFIG_DEVICE_TREE; system_ss is compiled once and

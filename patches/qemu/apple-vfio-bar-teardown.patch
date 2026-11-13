@@ -1,0 +1,14 @@
+--- a/hw/vfio/apple-device.c
++++ b/hw/vfio/apple-device.c
+@@ -810,6 +810,11 @@
+     int i;
+ 
+     if (bar < VFIO_PCI_BAR0_REGION_INDEX || bar >= VFIO_PCI_ROM_REGION_INDEX) {
++        return;
++    }
++
++    /* The parent finalizer can revisit BARs after the Apple state is gone. */
++    if (!adev->apple) {
+         return;
+     }
+ 
