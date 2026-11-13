@@ -1,0 +1,46 @@
+Venus vGPU
+
+This source distribution includes work from these projects and contributors.
+
+Mesa and the Mesa Venus developers
+  The Darwin Vulkan ICD is built from Mesa. The patches preserve Mesa's
+  file-level notices and license terms, including the notices from Google,
+  Collabora and other Mesa contributors. See the pinned Mesa source and
+  its licenses directory for the complete notices.
+
+Venus protocol and its contributors
+  The driver-side protocol generator and templates come from the pinned
+  Venus protocol repository. Its source files carry their original notices.
+
+virglrenderer and its contributors, including Collabora and Red Hat
+  The Linux renderer uses the UTM-maintained virglrenderer revision listed
+  in docs/PROVENANCE.md. See its COPYING and source notices. The patches
+  preserve the terms of the files they modify.
+
+QEMU, UTM and Scott J. Goldman
+  The QEMU runtime derives from QEMU and includes adaptations from UTM and
+  Scott Goldman's Apple Silicon PCI passthrough work. The host app and
+  DriverKit extension also derive in part from that work. See QEMU's
+  LICENSE, COPYING and COPYING.LIB, and the notices in individual files.
+
+The Linux kernel community and Fedora contributors
+  The guest uses Linux and packages from a Fedora aarch64 builder. The
+  Apple DMA, guest page pool and IVSHMEM modules retain their GPL and
+  Linux syscall exception notices where applicable.
+
+Device Tree Compiler and libfdt contributors
+  The host launcher and QEMU use libfdt. See README.license and the source
+  notices in the pinned DTC repository.
+
+The Cornell Box
+  The demo uses original procedural scene geometry and shaders inspired by
+  the Cornell Box experiment from the Cornell University Program of
+  Computer Graphics. It does not use Cornell's measured data or assets.
+
+SDL, Khronos, glslang and libpng contributors
+  The demo uses SDL3, the Vulkan loader and headers, glslang, and libpng.
+  Refer to the license notices supplied by the corresponding packages.
+
+NVIDIA is credited for the optional NVIDIA GPU driver and firmware.
+Those artifacts are fetched from NVIDIA or supplied locally by the user
+under their own terms. They are separate from this source distribution.

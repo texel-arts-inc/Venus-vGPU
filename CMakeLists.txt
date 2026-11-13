@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+cmake_minimum_required(VERSION 3.24)
+project(VenusVGPU VERSION 1.0 LANGUAGES C CXX)
+include(cmake/FindExecutable.cmake)
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+    message(FATAL_ERROR "Use an out-of-source build, for example cmake -S . -B build.")
+endif()

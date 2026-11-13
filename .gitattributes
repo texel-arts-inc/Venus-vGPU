@@ -1,0 +1,4 @@
+# Preserve the upstream texts and unified-diff context exactly.
+patches/** -whitespace
+LICENSES/** -whitespace
+host/qemu/licenses/** -whitespace
