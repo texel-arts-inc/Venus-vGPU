@@ -32,6 +32,16 @@ build/demo/venus-cornell --headless --mode ray --width 720 --height 720 \
 
 Replace `--headless` with `--once` to present and capture one frame through the SDL window. The PNG is read back from the Vulkan color image used for presentation. Interactive ray query rendering defaults to 16 samples per pixel. Use `--samples` to change the quality.
 
+For the throughput measurement, keep the window visible and run each mode
+three times. The benchmark warms up for 30 frames and reports the pixel
+extent, elapsed time, and application frame rate for the timed iterations.
+
+```sh
+build/demo/venus-cornell --mode raster --width 720 --height 720 --benchmark-frames 180
+build/demo/venus-cornell --mode mesh --width 720 --height 720 --benchmark-frames 180
+build/demo/venus-cornell --mode ray --width 720 --height 720 --samples 16 --benchmark-frames 180
+```
+
 ## Captures
 
 These 720×720 frames were rendered and presented with Venus on an NVIDIA RTX 4000 SFF Ada. The ray query capture used 384 samples per pixel.

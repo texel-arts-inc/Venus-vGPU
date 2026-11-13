@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -59,6 +60,7 @@ struct Options {
     bool headless = false;
     bool list = false;
     bool once = false;
+    uint32_t benchFrames = 0;
     bool help = false;
 };
 
@@ -106,6 +108,8 @@ Options parseOptions(int argc, char** argv) {
             options.headless = true;
         } else if (argument == "--list-modes") {
             options.list = true;
+        } else if (argument == "--benchmark-frames") {
+            options.benchFrames = number(10000);
         } else if (argument == "--once") {
             options.once = true;
         } else if (argument == "--help" || argument == "-h") {
@@ -113,6 +117,9 @@ Options parseOptions(int argc, char** argv) {
         } else {
             throw std::runtime_error("Unknown argument: " + std::string(argument));
         }
+    }
+    if (options.benchFrames && (options.headless || options.once || options.list)) {
+        throw std::runtime_error("--benchmark-frames requires the windowed render loop");
     }
     return options;
 }
@@ -1315,6 +1322,9 @@ void runWindow(Renderer& renderer, SDL_Window* window, const Options& options) {
     bool rebuild = true;
     bool redraw = true;
     std::string capture = options.capture;
+    uint32_t frames = 0;
+    constexpr uint32_t warmup = 30;
+    auto started = std::chrono::steady_clock::time_point{};
     const auto processEvent = [&](const SDL_Event& event) {
         if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
             running = false;
@@ -1360,8 +1370,23 @@ void runWindow(Renderer& renderer, SDL_Window* window, const Options& options) {
             }
             if (renderer.draw(mode, options.samples, capture)) {
                 capture.clear();
-                redraw = false;
+                redraw = options.benchFrames != 0;
                 if (options.once) return;
+                if (options.benchFrames != 0) {
+                    ++frames;
+                    if (frames == warmup) {
+                        std::cout << "BENCHMARK_EXTENT " << width << "x" << height << std::endl;
+                        started = std::chrono::steady_clock::now();
+                    } else if (frames == warmup + options.benchFrames) {
+                        const double elapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - started).count();
+                        std::cout << "BENCHMARK_FRAMES " << options.benchFrames
+                                  << " seconds " << elapsed
+                                  << " frames_per_second " << options.benchFrames / elapsed
+                                  << std::endl;
+                        return;
+                    }
+                }
             } else {
                 rebuild = true;
                 SDL_Delay(16);
@@ -1382,6 +1407,7 @@ int main(int argc, char** argv) {
         if (options.help) {
             std::cout << "Usage: venus-cornell [--mode raster|mesh|ray] [--width N] [--height N]\n"
                          "                     [--samples N] [--capture IMAGE.png] [--headless|--once]\n"
+                         "       venus-cornell --benchmark-frames N [--mode raster|mesh|ray]\n"
                          "       venus-cornell --list-modes\n"
                          "Keys: 1 vertex raster, 2 mesh raster, 3 ray query, S save PNG, Esc quit.\n";
             return 0;
