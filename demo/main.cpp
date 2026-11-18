@@ -12,6 +12,9 @@
 #include "raster_mesh.hpp"
 #include "raster_vert.hpp"
 #include "ray_frag.hpp"
+#ifdef VENUS_CORNELL_MEASURED
+#include "ray_measured_frag.hpp"
+#endif
 #include "scene.hpp"
 
 #include <algorithm>
@@ -31,6 +34,7 @@
 namespace {
 
 enum class Mode { raster, mesh, ray };
+enum class Scene { classic, measuredBoxes, measuredSpheres };
 constexpr std::array modes{Mode::raster, Mode::mesh, Mode::ray};
 
 const char* modeName(Mode mode) {
@@ -53,6 +57,7 @@ const char* modeTitle(Mode mode) {
 
 struct Options {
     Mode mode = Mode::raster;
+    Scene scene = Scene::classic;
     uint32_t width = 900;
     uint32_t height = 900;
     uint32_t samples = 16;
@@ -66,6 +71,7 @@ struct Options {
 
 Options parseOptions(int argc, char** argv) {
     Options options;
+    bool modeSpecified = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument = argv[i];
         const auto value = [&]() -> std::string_view {
@@ -93,12 +99,19 @@ Options parseOptions(int argc, char** argv) {
                 throw std::runtime_error("--mode requires raster, mesh, or ray");
             }
             options.mode = *mode;
+            modeSpecified = true;
+        } else if (argument == "--scene") {
+            const auto name = value();
+            if (name == "classic") options.scene = Scene::classic;
+            else if (name == "measured-boxes") options.scene = Scene::measuredBoxes;
+            else if (name == "measured-spheres") options.scene = Scene::measuredSpheres;
+            else throw std::runtime_error("--scene requires classic, measured-boxes, or measured-spheres");
         } else if (argument == "--width") {
             options.width = number(8192);
         } else if (argument == "--height") {
             options.height = number(8192);
         } else if (argument == "--samples") {
-            options.samples = number(1024);
+            options.samples = number(2048);
         } else if (argument == "--capture") {
             options.capture = value();
             if (options.capture.empty()) {
@@ -120,6 +133,15 @@ Options parseOptions(int argc, char** argv) {
     }
     if (options.benchFrames && (options.headless || options.once || options.list)) {
         throw std::runtime_error("--benchmark-frames requires the windowed render loop");
+    }
+    if (options.scene != Scene::classic && !options.help) {
+        if (modeSpecified && options.mode != Mode::ray) {
+            throw std::runtime_error("Measured scenes require --mode ray");
+        }
+#ifndef VENUS_CORNELL_MEASURED
+        throw std::runtime_error("Build with VENUS_CORNELL_DATA_DIR to use measured scenes");
+#endif
+        options.mode = Mode::ray;
     }
     return options;
 }
@@ -236,7 +258,9 @@ public:
     void initialize(const Options& options, SDL_Window* window);
     void initializeTargets(uint32_t width, uint32_t height);
     bool draw(Mode mode, uint32_t samples, const std::string& capture);
-    bool supports(Mode mode) const { return choice.supports(mode); }
+    bool supports(Mode mode) const {
+        return (sceneType == Scene::classic || mode == Mode::ray) && choice.supports(mode);
+    }
 
 private:
     void createInstance(SDL_Window* window);
@@ -273,6 +297,7 @@ private:
     VkInstance instance = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     DeviceChoice choice;
+    Scene sceneType = Scene::classic;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memoryProperties{};
@@ -329,6 +354,7 @@ Renderer::~Renderer() {
 }
 
 void Renderer::initialize(const Options& options, SDL_Window* window) {
+    sceneType = options.scene;
     createInstance(window);
     selectDevice(options.mode, options.list);
     if (options.list) {
@@ -624,7 +650,7 @@ VkDeviceAddress Renderer::addressOf(VkBuffer buffer) const {
 }
 
 void Renderer::createScene() {
-    const auto vertices = cornellBox();
+    const auto vertices = cornellBox(sceneType != Scene::measuredSpheres);
     vertexCount = static_cast<uint32_t>(vertices.size());
     const auto size = vertexCount * sizeof(Vertex);
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
@@ -1022,7 +1048,14 @@ void Renderer::createPipeline(Mode mode) {
     std::optional<Shader> fragment;
     if (ray) {
         first.emplace(device, fullscreen_vert);
-        fragment.emplace(device, ray_frag);
+#ifdef VENUS_CORNELL_MEASURED
+        if (sceneType != Scene::classic) {
+            fragment.emplace(device, ray_measured_frag);
+        } else
+#endif
+        {
+            fragment.emplace(device, ray_frag);
+        }
     } else {
         if (mesh) {
             first.emplace(device, raster_mesh);
@@ -1041,6 +1074,14 @@ void Renderer::createPipeline(Mode mode) {
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = fragment->module;
     stages[1].pName = "main";
+#ifdef VENUS_CORNELL_MEASURED
+    const VkBool32 showSpheres = sceneType == Scene::measuredSpheres ? VK_TRUE : VK_FALSE;
+    const VkSpecializationMapEntry sceneEntry{0, 0, sizeof(showSpheres)};
+    const VkSpecializationInfo sceneInfo{1, &sceneEntry, sizeof(showSpheres), &showSpheres};
+    if (ray && sceneType != Scene::classic) {
+        stages[1].pSpecializationInfo = &sceneInfo;
+    }
+#endif
 
     const VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
     const std::array<VkVertexInputAttributeDescription, 3> attributes{{
@@ -1307,17 +1348,22 @@ struct Window {
     }
 };
 
-void setTitle(SDL_Window* window, Mode mode, const std::string& status = {}) {
+void setTitle(SDL_Window* window, Mode mode, Scene sceneType, const std::string& status = {}) {
     std::string title = "Venus Cornell Box | ";
     title += modeTitle(mode);
-    title += " | 1 Raster  2 Mesh  3 Ray  S Save";
+    if (sceneType == Scene::classic) {
+        title += " | 1 Raster  2 Mesh  3 Ray  S Save";
+    } else {
+        title += sceneType == Scene::measuredSpheres ? " | Measured spheres" : " | Measured boxes";
+        title += " | S Save";
+    }
     if (!status.empty()) title += " | " + status;
     sdlCheck(SDL_SetWindowTitle(window, title.c_str()), "Set window title");
 }
 
 void runWindow(Renderer& renderer, SDL_Window* window, const Options& options) {
     Mode mode = options.mode;
-    setTitle(window, mode);
+    setTitle(window, mode, options.scene);
     bool running = true;
     bool rebuild = true;
     bool redraw = true;
@@ -1345,11 +1391,11 @@ void runWindow(Renderer& renderer, SDL_Window* window, const Options& options) {
                 const auto selected = modes[static_cast<size_t>(key - SDLK_1)];
                 if (renderer.supports(selected)) {
                     mode = selected;
-                    setTitle(window, mode);
+                    setTitle(window, mode, options.scene);
                     redraw = true;
                 } else {
                     const std::string status = std::string(modeTitle(selected)) + " unavailable";
-                    setTitle(window, mode, status);
+                    setTitle(window, mode, options.scene, status);
                     std::cerr << status << " on this Vulkan device\n";
                 }
             }
@@ -1406,6 +1452,7 @@ int main(int argc, char** argv) {
         const auto options = parseOptions(argc, argv);
         if (options.help) {
             std::cout << "Usage: venus-cornell [--mode raster|mesh|ray] [--width N] [--height N]\n"
+                         "                     [--scene classic|measured-boxes|measured-spheres]\n"
                          "                     [--samples N] [--capture IMAGE.png] [--headless|--once]\n"
                          "       venus-cornell --benchmark-frames N [--mode raster|mesh|ray]\n"
                          "       venus-cornell --list-modes\n"

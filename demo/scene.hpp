@@ -30,7 +30,7 @@ struct Vertex {
     std::array<float, 4> material;
 };
 
-inline std::vector<Vertex> cornellBox() {
+inline std::vector<Vertex> cornellBox(bool includeBlocks) {
     std::vector<Vertex> vertices;
     constexpr Vec3 white{0.76f, 0.73f, 0.68f};
     constexpr Vec3 red{0.72f, 0.045f, 0.030f};
@@ -70,7 +70,9 @@ inline std::vector<Vertex> cornellBox() {
         quad(d, D, A, a, plaster);
         quad(A, D, C, B, plaster);
     };
-    block(-.40f, -.36f, .285f, .285f, 1.16f, -.29f);
-    block(.38f, .28f, .32f, .31f, .59f, .31f);
+    if (includeBlocks) {
+        block(-.40f, -.36f, .285f, .285f, 1.16f, -.29f);
+        block(.38f, .28f, .32f, .31f, .59f, .31f);
+    }
     return vertices;
 }

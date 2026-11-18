@@ -35,7 +35,10 @@ Device Tree Compiler and libfdt contributors
 The Cornell Box
   The demo uses original procedural scene geometry and shaders inspired by
   the Cornell Box experiment from the Cornell University Program of
-  Computer Graphics. It does not use Cornell's measured data or assets.
+  Computer Graphics. The optional measured scenes use Cornell's paint
+  reflectance and lamp measurements with the CIE 1931 2-degree observer
+  data (doi:10.25039/CIE.DS.xvudnb9b). The user supplies the raw
+  measurement files. See demo/README.md for source links.
 
 SDL, Khronos, glslang and libpng contributors
   The demo uses SDL3, the Vulkan loader and headers, glslang, and libpng.
